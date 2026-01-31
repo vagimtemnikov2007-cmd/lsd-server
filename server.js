@@ -39,85 +39,103 @@ app.get("/api/models", async (req, res) => {
   }
 });
 
-// основной эндпоинт
 app.post("/api/plan", async (req, res) => {
-  const { text, profile } = req.body || {};
+  try {
+    const { text, profile } = req.body || {};
+    if (!text || typeof text !== "string") {
+      return res.status(400).json({ error: "text_required" });
+    }
 
-  if (!text) {
-    return res.status(400).json({ error: "text_required" });
-  }
+    const prompt = `
+Ты — LSD (AI Time Manager).
+Задача: помоги пользователю разбить задачу на 3–5 небольших шагов.
 
-  const systemPrompt = `
-Ты — AI-планировщик LSD.
-Сначала ответь пользователю коротким текстом (2–5 предложений).
-Затем ОБЯЗАТЕЛЬНО верни JSON между маркерами:
+Требования к ответу:
+1) Сначала обычный текст (коротко, по делу).
+2) Потом JSON строго между маркерами:
 
 @@LSD_JSON_START@@
-{
-  "cards": [
-    {
-      "title": "Название плана",
-      "tasks": [
-        { "t": "Короткая задача", "min": 10, "energy": "light" }
-      ]
-    }
-  ]
-}
+{ "cards": [ { "title": "...", "tasks": [ { "t": "...", "min": 30, "energy": "focus" } ] } ] }
 @@LSD_JSON_END@@
 
-Правила:
-- cards: от 1 до 5
-- tasks: от 1 до 8
-- energy: только light | focus | hard
-- задачи короткие: глагол + объект
-`;
+Профиль:
+nick: ${profile?.nick || ""}
+age: ${profile?.age ?? ""}
+bio: ${profile?.bio || ""}
 
-  const userPrompt = `
-Профиль пользователя:
-- псевдоним: ${profile?.nick ?? ""}
-- возраст: ${profile?.age ?? ""}
-- информация: ${profile?.bio ?? ""}
-
-Запрос:
+Запрос пользователя:
 ${text}
-`;
+`.trim();
 
-  try {
-    const MODEL = "gemini-2.0-flash";
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${process.env.GEMINI_API_KEY}`;
 
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${GEMINI_API_KEY}`;
-
-    const response = await fetch(url, {
+    const resp = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        contents: [
-          {
-            role: "user",
-            parts: [{ text: systemPrompt + "\n\n" + userPrompt }],
-          },
-        ],
-        generationConfig: { temperature: 0.4 },
-      }),
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { temperature: 0.6 }
+      })
     });
 
-    const data = await response.json();
-    console.log("RAW GEMINI RESPONSE:", JSON.stringify(data, null, 2));
+    const rawJson = await resp.json();
 
-    const textOut =
-      data?.candidates?.[0]?.content?.parts?.map((p) => p.text).join("") || "";
+    if (!resp.ok) {
+      const msg = rawJson?.error?.message || "gemini_error";
+      return res.status(resp.status).json({ error: msg });
+    }
 
-    const parsed = extractCards(textOut);
+    // ✅ НАДЁЖНО достаём текст
+    const rawText =
+      rawJson?.candidates?.[0]?.content?.parts
+        ?.map(p => (typeof p.text === "string" ? p.text : ""))
+        .join("")
+        .trim() || "";
 
-    res.json({
-      text: textOut,
-      cards: parsed?.cards ?? [],
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "ai_failed" });
+    if (!rawText) {
+      // чтобы не было "тишины" — вернём debug (временно)
+      return res.json({ text: "", cards: [], debug: rawJson });
+    }
+
+    // ✅ Парсим JSON блок (если есть)
+    const START = "@@LSD_JSON_START@@";
+    const END = "@@LSD_JSON_END@@";
+
+    const start = rawText.indexOf(START);
+    const end = rawText.indexOf(END);
+
+    let cards = [];
+    let cleanText = rawText;
+
+    if (start !== -1 && end !== -1 && end > start) {
+      const jsonBlock = rawText.slice(start + START.length, end).trim();
+
+      // текст без JSON блока
+      cleanText = (
+        rawText.slice(0, start) +
+        rawText.slice(end + END.length)
+      ).trim();
+
+      try {
+        const parsed = JSON.parse(jsonBlock);
+        if (Array.isArray(parsed?.cards)) cards = parsed.cards;
+      } catch {
+        // JSON сломан — карточки пустые, но текст всё равно отдаём
+        cards = [];
+      }
+    }
+
+    // ✅ Гарантия: если cleanText пустой — отдай rawText
+    if (!cleanText) cleanText = rawText;
+
+    return res.json({ text: cleanText, cards });
+
+  } catch (e) {
+    console.error("SERVER ERROR:", e);
+    return res.status(500).json({ error: "server_error" });
   }
 });
+
 
 function extractCards(fullText) {
   const start = "@@LSD_JSON_START@@";
