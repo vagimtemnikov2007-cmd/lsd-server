@@ -312,4 +312,33 @@ ${transcript}
   }
 });
 
+// =========================
+// API: USER INIT (create user on app open)
+// =========================
+app.post("/api/user/init", async (req, res) => {
+  try {
+    const tg_id = Number(req.body?.tg_id);
+    const profile = req.body?.profile || {};
+
+    if (!Number.isFinite(tg_id)) {
+      return res.status(400).json({ error: "tg_id_required" });
+    }
+
+    const user = await getOrCreateUser(tg_id);
+
+    return res.json({
+      ok: true,
+      tier: user.tier,
+      plans_left: user.plans_left,
+    });
+  } catch (e) {
+    console.error("USER INIT ERROR:", e);
+    return res.status(500).json({
+      error: "server_error",
+      details: String(e.message || e),
+    });
+  }
+});
+  
+
 app.listen(PORT, () => console.log(`✅ Server running on ${PORT}`));
