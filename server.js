@@ -317,7 +317,7 @@ ${transcript}
 // =========================
 app.post("/api/user/init", async (req, res) => {
   try {
-    const tg_id = getTgIdOrNull() ?? 999999999;
+    const tg_id = Number(req.body?.tg_id);
     const profile = req.body?.profile || {};
 
     if (!Number.isFinite(tg_id)) {
@@ -339,6 +339,6 @@ app.post("/api/user/init", async (req, res) => {
     });
   }
 });
-  
+
 
 app.listen(PORT, () => console.log(`✅ Server running on ${PORT}`));
