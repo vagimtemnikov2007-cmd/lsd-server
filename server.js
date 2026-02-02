@@ -1,5 +1,6 @@
 import express from "express";
 import dotenv from "dotenv";
+import { createClient } from "@supabase/supabase-js";
 
 dotenv.config();
 
@@ -16,47 +17,41 @@ app.use((req, res, next) => {
 });
 
 const PORT = process.env.PORT || 3000;
+
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 if (!GEMINI_API_KEY) {
   console.error("❌ GEMINI_API_KEY не найден в .env");
   process.exit(1);
 }
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+  console.error("❌ SUPABASE_URL или SUPABASE_SERVICE_ROLE_KEY не найдены в .env");
+  process.exit(1);
+}
+
+// ✅ Supabase client (ВАЖНО: service_role — только на сервере)
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 // health check
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-app.get("/api/models", async (req, res) => {
-  try {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_API_KEY}`;
-    const r = await fetch(url);
-    const data = await r.json();
-    res.json(data);
-  } catch (e) {
-    res.status(500).json({ error: "list_models_failed" });
-  }
-});
-
 // =========================
-// HELPERS
+// HELPERS (Gemini)
 // =========================
 function safeStr(x) {
   return typeof x === "string" ? x : "";
 }
 
 function normalizeHistory(history) {
-  // ожидаем [{role:'user'|'assistant', content:'...'}]
   if (!Array.isArray(history)) return [];
   return history
     .map((m) => ({
-      role: m?.role === "assistant" ? "assistantица:assistant" : "user", // role не так важен, просто метка
+      role: m?.role === "assistant" ? "AI" : "User",
       content: safeStr(m?.content).trim(),
     }))
-    .filter((m) => m.content.length > 0)
-    .map((m) => ({
-      role: m.role === "user" ? "User" : "AI",
-      content: m.content,
-    }));
+    .filter((m) => m.content.length > 0);
 }
 
 function buildTranscriptFromHistory(history) {
@@ -76,8 +71,6 @@ function extractJsonCards(rawText) {
   }
 
   const jsonBlock = rawText.slice(start + START.length, end).trim();
-
-  // текст без JSON блока
   let cleanText = (rawText.slice(0, start) + rawText.slice(end + END.length)).trim();
   if (!cleanText) cleanText = rawText.trim();
 
@@ -85,7 +78,7 @@ function extractJsonCards(rawText) {
     const parsed = JSON.parse(jsonBlock);
     const cards = Array.isArray(parsed?.cards) ? parsed.cards : [];
     return { cleanText, cards, found: true, jsonError: null };
-  } catch (e) {
+  } catch {
     return { cleanText, cards: [], found: true, jsonError: "bad_json" };
   }
 }
@@ -107,7 +100,7 @@ async function callGemini(prompt) {
 
   if (!resp.ok) {
     const msg = rawJson?.error?.message || "gemini_error";
-    return { ok: false, status: resp.status, error: msg, raw: rawJson };
+    return { ok: false, status: resp.status, error: msg };
   }
 
   const text =
@@ -116,41 +109,99 @@ async function callGemini(prompt) {
       .join("")
       .trim() || "";
 
-  return { ok: true, text, raw: rawJson };
+  return { ok: true, text };
+}
+
+// =========================
+// DB HELPERS
+// =========================
+
+// 1) получить / создать пользователя по tg_id
+async function getOrCreateUserByTgId(tg_id) {
+  // tg_id обязателен
+  if (!Number.isFinite(tg_id)) throw new Error("bad_tg_id");
+
+  // пробуем взять
+  const { data: found, error: selErr } = await supabase
+    .from("lsd_users")
+    .select("*")
+    .eq("tg_id", tg_id)
+    .maybeSingle();
+
+  if (selErr) throw selErr;
+  if (found) return found;
+
+  // создаём
+  const { data: created, error: insErr } = await supabase
+    .from("lsd_users")
+    .insert({ tg_id })
+    .select("*")
+    .single();
+
+  if (insErr) throw insErr;
+  return created;
+}
+
+// 2) атомарно списать план и сохранить current_plan через RPC
+async function consumePlanAndSave(tg_id, planJson) {
+  const { data, error } = await supabase.rpc("consume_plan_and_save", {
+    p_tg_id: tg_id,
+    p_plan: planJson ?? {},
+  });
+
+  if (error) throw error;
+
+  // RPC returns array rows in supabase-js
+  const row = Array.isArray(data) ? data[0] : data;
+  return row; // { ok, plans_left, user_row }
 }
 
 // =========================
 // MAIN ENDPOINT
 // =========================
+//
+// ВАЖНО: теперь клиент должен присылать tg_id (из Telegram WebApp)
+// body: { tg_id, mode, text, profile, history, transcript }
+//
 app.post("/api/plan", async (req, res) => {
   try {
     const body = req.body || {};
     const mode = body.mode === "plan" ? "plan" : "chat"; // default chat
 
+    // ✅ tg_id (обязателен)
+    const tg_id = Number(body.tg_id);
+    if (!Number.isFinite(tg_id)) {
+      return res.status(400).json({ error: "tg_id_required" });
+    }
+
     const profile = body.profile || {};
-    const history = body.history;       // массив
-    const transcript = safeStr(body.transcript); // строка
-    const text = safeStr(body.text).trim();      // последнее сообщение
+    const history = body.history;
+    const transcript = safeStr(body.transcript);
+    const text = safeStr(body.text).trim();
 
-    // Собираем полный контекст:
+    // контекст
     const historyTranscript =
-      transcript.trim() ||
-      buildTranscriptFromHistory(history) ||
-      "";
+      transcript.trim() || buildTranscriptFromHistory(history) || "";
 
-    // === Валидация ===
-    // chat: нужно последнее сообщение text
+    // создадим пользователя (или возьмём)
+    const user = await getOrCreateUserByTgId(tg_id);
+
+    // chat: нужно text
     if (mode === "chat") {
       if (!text) return res.status(400).json({ error: "text_required" });
     }
 
-    // plan: можно без text, главное чтобы была история
+    // plan: нужен контекст
     if (mode === "plan") {
       const hasAnyContext = !!historyTranscript.trim() || !!text;
       if (!hasAnyContext) return res.status(400).json({ error: "history_required" });
+
+      // ✅ проверка лимита на сервере до вызова AI (экономим деньги)
+      if ((user.plans_left ?? 0) <= 0) {
+        return res.status(403).json({ error: "no_plans_left", plans_left: user.plans_left ?? 0 });
+      }
     }
 
-    // === PROMPTS ===
     const profileBlock = `
 Профиль пользователя:
 nick: ${profile?.nick || ""}
@@ -161,7 +212,6 @@ bio: ${profile?.bio || ""}
     let prompt = "";
 
     if (mode === "chat") {
-      // ✅ обычный чат-режим (БЕЗ карточек)
       prompt = `
 Ты — LSD (AI Time Manager). Ты дружелюбный и умный собеседник.
 Твоя цель — обсуждать тему с пользователем, задавать уточняющие вопросы, помогать думать.
@@ -180,7 +230,6 @@ ${historyTranscript}
 ${text}
 `.trim();
     } else {
-      // ✅ режим плана (ТОЛЬКО по кнопке "Создать план")
       prompt = `
 Ты — LSD (AI Time Manager).
 Задача: СДЕЛАЙ ПЛАН в виде карточек на основе ВСЕЙ переписки.
@@ -189,8 +238,8 @@ ${text}
 Требования к карточкам:
 - 1–4 карточки
 - в каждой карточке 3–6 задач
-- задачи должны быть конкретные, маленькие, выполнимые
-- min: 10..180 (минуты)
+- задачи конкретные, маленькие, выполнимые
+- min: 10..180
 - energy: "focus" | "easy" | "hard"
 
 Формат (строго):
@@ -205,28 +254,21 @@ ${historyTranscript || text}
 `.trim();
     }
 
-    // === CALL GEMINI ===
+    // call AI
     const out = await callGemini(prompt);
+    if (!out.ok) return res.status(out.status).json({ error: out.error });
+    if (!out.text) return res.json({ text: "", cards: [], debug: "empty_text" });
 
-    if (!out.ok) {
-      return res.status(out.status).json({ error: out.error });
-    }
-
-    if (!out.text) {
-      return res.json({ text: "", cards: [], debug: "empty_text" });
-    }
-
-    // === RESPONSE FORMATTING ===
+    // chat -> только текст
     if (mode === "chat") {
-      // chat mode -> только текст
       return res.json({ text: out.text, cards: [] });
     }
 
-    // plan mode -> парсим cards
+    // plan -> parse cards
     const parsed = extractJsonCards(out.text);
 
+    // если нет карточек — вернём ошибку (без списания лимита)
     if (!parsed.cards.length) {
-      // если Gemini “забыл” JSON — вернём ошибку, чтобы ты видел
       return res.json({
         text: parsed.cleanText,
         cards: [],
@@ -234,7 +276,28 @@ ${historyTranscript || text}
       });
     }
 
-    return res.json({ text: parsed.cleanText, cards: parsed.cards });
+    // ✅✅✅ ВОТ ТУТ МЫ СПИСЫВАЕМ ПЛАН И СОХРАНЯЕМ current_plan АТОМАРНО
+    const savePayload = {
+      cards: parsed.cards,
+      text: parsed.cleanText,
+      created_at: new Date().toISOString(),
+    };
+
+    const r = await consumePlanAndSave(tg_id, savePayload);
+
+    if (!r?.ok) {
+      // если лимит закончился прямо сейчас (гонка) — сообщаем
+      return res.status(403).json({
+        error: "no_plans_left",
+        plans_left: r?.plans_left ?? 0,
+      });
+    }
+
+    return res.json({
+      text: parsed.cleanText,
+      cards: parsed.cards,
+      plans_left: r.plans_left,
+    });
   } catch (e) {
     console.error("SERVER ERROR:", e);
     return res.status(500).json({ error: "server_error" });
