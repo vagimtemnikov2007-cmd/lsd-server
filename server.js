@@ -317,7 +317,7 @@ ${transcript}
 // =========================
 app.post("/api/user/init", async (req, res) => {
   try {
-    const tg_id = Number(req.body?.tg_id);
+    const tg_id = getTgIdOrNull() ?? 999999999;
     const profile = req.body?.profile || {};
 
     if (!Number.isFinite(tg_id)) {
