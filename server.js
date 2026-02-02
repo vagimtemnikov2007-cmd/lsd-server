@@ -31,14 +31,14 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   process.exit(1);
 }
 
-// ✅ Supabase client (ВАЖНО: service_role — только на сервере)
+// ✅ Supabase client (service_role — только на сервере)
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
-// health check
+// health
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 // =========================
-// HELPERS (Gemini)
+// HELPERS
 // =========================
 function safeStr(x) {
   return typeof x === "string" ? x : "";
@@ -115,13 +115,10 @@ async function callGemini(prompt) {
 // =========================
 // DB HELPERS
 // =========================
-
-// 1) получить / создать пользователя по tg_id
 async function getOrCreateUserByTgId(tg_id) {
-  // tg_id обязателен
   if (!Number.isFinite(tg_id)) throw new Error("bad_tg_id");
 
-  // пробуем взять
+  // 1) select
   const { data: found, error: selErr } = await supabase
     .from("lsd_users")
     .select("*")
@@ -131,10 +128,16 @@ async function getOrCreateUserByTgId(tg_id) {
   if (selErr) throw selErr;
   if (found) return found;
 
-  // создаём
+  // 2) insert with FREE tier
+  // plans_left можно НЕ задавать — возьмётся default из таблицы
   const { data: created, error: insErr } = await supabase
     .from("lsd_users")
-    .insert({ tg_id })
+    .insert({
+      tg_id,
+      tier: "free",            // ✅ статус по умолчанию
+      // plans_left: 1,         // если хочешь задавать тут — раскомментируй
+      // current_plan: {},      // можно не трогать, если default {}
+    })
     .select("*")
     .single();
 
@@ -142,7 +145,7 @@ async function getOrCreateUserByTgId(tg_id) {
   return created;
 }
 
-// 2) атомарно списать план и сохранить current_plan через RPC
+// списание + сохранение (только для НЕ developer)
 async function consumePlanAndSave(tg_id, planJson) {
   const { data, error } = await supabase.rpc("consume_plan_and_save", {
     p_tg_id: tg_id,
@@ -151,7 +154,6 @@ async function consumePlanAndSave(tg_id, planJson) {
 
   if (error) throw error;
 
-  // RPC returns array rows in supabase-js
   const row = Array.isArray(data) ? data[0] : data;
   return row; // { ok, plans_left, user_row }
 }
@@ -159,16 +161,12 @@ async function consumePlanAndSave(tg_id, planJson) {
 // =========================
 // MAIN ENDPOINT
 // =========================
-//
-// ВАЖНО: теперь клиент должен присылать tg_id (из Telegram WebApp)
-// body: { tg_id, mode, text, profile, history, transcript }
-//
 app.post("/api/plan", async (req, res) => {
   try {
     const body = req.body || {};
-    const mode = body.mode === "plan" ? "plan" : "chat"; // default chat
+    const mode = body.mode === "plan" ? "plan" : "chat";
 
-    // ✅ tg_id (обязателен)
+    // ✅ tg_id обязателен
     const tg_id = Number(body.tg_id);
     if (!Number.isFinite(tg_id)) {
       return res.status(400).json({ error: "tg_id_required" });
@@ -179,26 +177,27 @@ app.post("/api/plan", async (req, res) => {
     const transcript = safeStr(body.transcript);
     const text = safeStr(body.text).trim();
 
-    // контекст
     const historyTranscript =
       transcript.trim() || buildTranscriptFromHistory(history) || "";
 
-    // создадим пользователя (или возьмём)
+    // ✅ user create / fetch (free by default)
     const user = await getOrCreateUserByTgId(tg_id);
+    const tier = safeStr(user?.tier) || "free";
+    const plansLeft = Number.isFinite(user?.plans_left) ? user.plans_left : 0;
 
-    // chat: нужно text
+    // chat: нужен text
     if (mode === "chat") {
-      if (!text) return res.status(400).json({ error: "text_required" });
+      if (!text) return res.status(400).json({ error: "text_required", tier, plans_left: plansLeft });
     }
 
     // plan: нужен контекст
     if (mode === "plan") {
       const hasAnyContext = !!historyTranscript.trim() || !!text;
-      if (!hasAnyContext) return res.status(400).json({ error: "history_required" });
+      if (!hasAnyContext) return res.status(400).json({ error: "history_required", tier, plans_left: plansLeft });
 
-      // ✅ проверка лимита на сервере до вызова AI (экономим деньги)
-      if ((user.plans_left ?? 0) <= 0) {
-        return res.status(403).json({ error: "no_plans_left", plans_left: user.plans_left ?? 0 });
+      // ✅ лимит проверяем только если НЕ developer
+      if (tier !== "developer" && plansLeft <= 0) {
+        return res.status(403).json({ error: "no_plans_left", tier, plans_left: plansLeft });
       }
     }
 
@@ -254,29 +253,53 @@ ${historyTranscript || text}
 `.trim();
     }
 
-    // call AI
+    // ✅ call AI
     const out = await callGemini(prompt);
-    if (!out.ok) return res.status(out.status).json({ error: out.error });
-    if (!out.text) return res.json({ text: "", cards: [], debug: "empty_text" });
+    if (!out.ok) return res.status(out.status).json({ error: out.error, tier, plans_left: plansLeft });
+    if (!out.text) return res.json({ text: "", cards: [], tier, plans_left: plansLeft, debug: "empty_text" });
 
     // chat -> только текст
     if (mode === "chat") {
-      return res.json({ text: out.text, cards: [] });
+      return res.json({ text: out.text, cards: [], tier, plans_left: plansLeft });
     }
 
     // plan -> parse cards
     const parsed = extractJsonCards(out.text);
 
-    // если нет карточек — вернём ошибку (без списания лимита)
+    // если нет карточек — без списания
     if (!parsed.cards.length) {
       return res.json({
         text: parsed.cleanText,
         cards: [],
+        tier,
+        plans_left: plansLeft,
         error: parsed.found ? "plan_json_invalid" : "plan_json_missing",
       });
     }
 
-    // ✅✅✅ ВОТ ТУТ МЫ СПИСЫВАЕМ ПЛАН И СОХРАНЯЕМ current_plan АТОМАРНО
+    // ✅ если developer — НЕ списываем, просто сохраняем current_plan (опционально)
+    if (tier === "developer") {
+      const savePayload = {
+        cards: parsed.cards,
+        text: parsed.cleanText,
+        created_at: new Date().toISOString(),
+      };
+
+      // optional: сохраняем current_plan, но не уменьшаем plans_left
+      await supabase
+        .from("lsd_users")
+        .update({ current_plan: savePayload })
+        .eq("tg_id", tg_id);
+
+      return res.json({
+        text: parsed.cleanText,
+        cards: parsed.cards,
+        tier,
+        plans_left: plansLeft, // не меняем
+      });
+    }
+
+    // ✅✅✅ обычные юзеры: атомарно списать + сохранить current_plan
     const savePayload = {
       cards: parsed.cards,
       text: parsed.cleanText,
@@ -286,9 +309,9 @@ ${historyTranscript || text}
     const r = await consumePlanAndSave(tg_id, savePayload);
 
     if (!r?.ok) {
-      // если лимит закончился прямо сейчас (гонка) — сообщаем
       return res.status(403).json({
         error: "no_plans_left",
+        tier,
         plans_left: r?.plans_left ?? 0,
       });
     }
@@ -296,6 +319,7 @@ ${historyTranscript || text}
     return res.json({
       text: parsed.cleanText,
       cards: parsed.cards,
+      tier,
       plans_left: r.plans_left,
     });
   } catch (e) {
