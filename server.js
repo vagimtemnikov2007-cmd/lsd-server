@@ -293,19 +293,56 @@ ${transcript}
     }
 
     // consume using your RPC if you have it
-    const { data, error } = await supabase.rpc("consume_plan_and_save", {
-      p_tg_id: tg_id,
-      p_plan: payload,
-    });
-    if (error) throw error;
+const { data, error } = await supabase.rpc("consume_plan_and_save", {
+  p_tg_id: tg_id,
+  p_plan: payload,
+});
 
-    const row = Array.isArray(data) ? data[0] : data;
-    return res.json({
-      cards: parsed.cards,
-      text: parsed.cleanText,
-      tier,
-      plans_left: row?.plans_left ?? 0,
+if (error) {
+  console.error("RPC consume_plan_and_save ERROR:", error);
+
+  // твои RAISE EXCEPTION из plpgsql обычно приходят как P0001
+  if (error.code === "P0001") {
+    const msg = String(error.message || "");
+
+    if (msg.includes("no_plans_left")) {
+      return res.status(403).json({
+        error: "no_plans_left",
+        tier,
+        plans_left: plansLeft,
+      });
+    }
+
+    if (msg.includes("user_not_found")) {
+      return res.status(404).json({
+        error: "user_not_found",
+      });
+    }
+
+    // неизвестная P0001, но всё равно это "логическая" ошибка
+    return res.status(400).json({
+      error: "plan_consume_failed",
+      details: msg,
     });
+  }
+
+  // все остальные ошибки — серверные
+  return res.status(500).json({
+    error: "server_error",
+    details: String(error.message || error),
+  });
+}
+
+// data может быть объектом или массивом (зависит от функции)
+const row = Array.isArray(data) ? data[0] : data;
+
+return res.json({
+  cards: parsed.cards,
+  text: parsed.cleanText,
+  tier,
+  plans_left: row?.plans_left ?? 0,
+});
+
   } catch (e) {
     console.error("PLAN ERROR:", e);
     return res.status(500).json({ error: "server_error", details: String(e.message || e) });
