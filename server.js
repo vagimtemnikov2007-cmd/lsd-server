@@ -563,27 +563,31 @@ return res.json({
 // =========================
 // API: SYNC PUSH
 // =========================
-app.post("/api/sync/push", async (req, res) => {
+app.post("/api/sync/pull", async (req, res) => {
   try {
     const tg_id = Number(req.body?.tg_id);
-    const chats_upsert = req.body?.chats_upsert;
-    const messages_upsert = req.body?.messages_upsert;
-    const tasks_state = req.body?.tasks_state;
+    const since = safeStr(req.body?.since || "");
 
     if (!Number.isFinite(tg_id)) return res.status(400).json({ error: "tg_id_required" });
 
     await getOrCreateUser(tg_id);
 
-    await upsertChats(tg_id, chats_upsert);
-    await upsertMessages(tg_id, messages_upsert);
+    const chats = await listChats(tg_id);
+    const messages = await listMessages(tg_id, since || null, 2000);
 
-    if (tasks_state) await saveTasksState(tg_id, tasks_state);
+    let tasks_state = { groups: [] };
+    try {
+      tasks_state = await loadTasksState(tg_id);
+    } catch (e) {
+      console.warn("tasks_state skipped:", e?.message || e);
+    }
 
-    return res.json({ ok: true, server_time: nowISO() });
+    return res.json({ ok: true, chats, messages, tasks_state, server_time: nowISO() });
   } catch (e) {
-    console.error("SYNC PUSH ERROR:", e);
+    console.error("SYNC PULL ERROR:", e);
     return res.status(500).json({ error: "server_error", details: String(e.message || e) });
   }
 });
+
 
 app.listen(PORT, () => console.log(`✅ Server running on ${PORT}`));
