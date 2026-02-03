@@ -63,6 +63,43 @@ function extractCards(text) {
     return { cleanText, cards: [], ok: false };
   }
 }
+async function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+
+async function callGemini(prompt) {
+  const url =
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { temperature: 0.6 },
+      }),
+    });
+
+    const json = await r.json().catch(() => ({}));
+
+    if (r.ok) {
+      return (
+        json?.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("").trim() || ""
+      );
+    }
+
+    // 429: ждём и пробуем ещё раз
+    if (r.status === 429) {
+      const wait = 800 * attempt; // 0.8s, 1.6s, 2.4s
+      await sleep(wait);
+      continue;
+    }
+
+    throw new Error(json?.error?.message || `gemini_error_${r.status}`);
+  }
+
+  // если 3 попытки не помогли
+  return "Сейчас слишком много запросов (лимит API). Попробуй через минуту 🙂";
+}
 
 async function callGemini(prompt) {
   const url =
