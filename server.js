@@ -538,15 +538,22 @@ app.post("/api/sync/pull", async (req, res) => {
 
     const chats = await listChats(tg_id);
     const messages = await listMessages(tg_id, since || null, 3000);
-    const tasks_state = await loadTasksState(tg_id);
+    let tasks_state = { groups: [] };
+try {
+  tasks_state = await loadTasksState(tg_id);
+} catch (e) {
+  // таблицы может не быть — это не должно ломать синк
+  console.warn("loadTasksState skipped:", e?.message || e);
+}
 
-    return res.json({
-      ok: true,
-      chats,
-      messages,
-      tasks_state,
-      server_time: nowISO(),
-    });
+return res.json({
+  ok: true,
+  chats,
+  messages,
+  tasks_state,
+  server_time: nowISO(),
+});
+
   } catch (e) {
     console.error("SYNC PULL ERROR:", e);
     return res.status(500).json({ error: "server_error", details: String(e.message || e) });
