@@ -17,7 +17,7 @@ const PORT = process.env.PORT || 3000;
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
 // bucket name in Supabase Storage (optional)
 const STORAGE_BUCKET = process.env.SUPABASE_BUCKET || "lsd_uploads";
@@ -28,8 +28,8 @@ const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini"; // пример
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   console.warn("⚠️ SUPABASE env is missing (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY).");
 }
-if (!OPENAI_API_KEY) {
-  console.warn("⚠️ OPENAI_API_KEY is missing.");
+if (!GEMINI_API_KEY) {
+  console.warn("⚠️ GEMINI_API_KEY is missing.");
 }
 
 const supabase =
@@ -81,7 +81,7 @@ async function openaiResponses({ input }) {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      Authorization: `Bearer ${GEMINI_API_KEY}`,
     },
     body: JSON.stringify({
       model: OPENAI_MODEL,
@@ -299,8 +299,8 @@ app.post("/api/chat/send", async (req, res) => {
       history = (rows || []).map((r) => ({ role: r.role, content: r.content }));
     }
 
-    if (!OPENAI_API_KEY) {
-      const fallback = "OPENAI_API_KEY не задан. Я сохранил сообщение, но не могу спросить ИИ.";
+    if (GEMINI_API_KEY) {
+      const fallback = "GEMINI_API_KEY не задан. Я сохранил сообщение, но не могу спросить ИИ.";
       await insertMessage({ tg_id, chat_id, msg_id: uid(), role: "assistant", content: fallback, created_at: nowISO() });
       return res.json({ text: fallback });
     }
@@ -366,7 +366,7 @@ app.post("/api/chat/attach", upload.single("file"), async (req, res) => {
 
     await insertMessage({ tg_id, chat_id, msg_id: uid(), role: "user", content: userLabel, created_at: nowISO() });
 
-    if (!OPENAI_API_KEY) {
+    if (!GEMINI_API_KEY) {
       const fallback = "OPENAI_API_KEY не задан. Файл/фото сохранил, но не могу отправить ИИ.";
       await insertMessage({ tg_id, chat_id, msg_id: uid(), role: "assistant", content: fallback, created_at: nowISO() });
       return res.json({ text: fallback });
