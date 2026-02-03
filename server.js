@@ -287,37 +287,35 @@ async function listChats(tg_id) {
     .select("chat_id,title,emoji,updated_at")
     .eq("tg_id", tg_id)
     .order("updated_at", { ascending: false })
-    .limit(200);
+    .limit(100);
 
   if (error) throw error;
   return data || [];
 }
 
-async function listMessages(tg_id, sinceISO = null, limit = 3000) {
-  // ВАЖНО: если в БД нет msg_id — не выбираем его, иначе будет PGRST204
-  // Проверить "есть ли колонка msg_id" из кода без schema introspection сложно,
-  // поэтому делаем безопасный вариант: пробуем select с msg_id, если упало — повторяем без него.
-  const base = supabase
+async function listMessages(tg_id, sinceISO = null, limit = 2000) {
+  // ВАЖНО: сначала select(), потом фильтры eq/gte/order/limit
+  let q = supabase
     .from("lsd_messages")
+    .select("chat_id,msg_id,role,content,created_at")
     .eq("tg_id", tg_id)
     .order("created_at", { ascending: true })
     .limit(limit);
 
-  const q1 = sinceISO ? base.gte("created_at", sinceISO) : base;
+  if (sinceISO) q = q.gte("created_at", sinceISO);
 
-  // try #1 with msg_id
-  {
-    const { data, error } = await q1.select("chat_id,msg_id,role,content,created_at");
-    if (!error) {
-      return (data || []).map((m) => ({
-        chat_id: m.chat_id,
-        msg_id: m.msg_id,
-        role: m.role,
-        content: m.content,
-        created_at: m.created_at,
-      }));
-    }
-  }
+  const { data, error } = await q;
+  if (error) throw error;
+
+  return (data || []).map((m) => ({
+    chat_id: m.chat_id,
+    msg_id: m.msg_id,
+    role: m.role,
+    content: m.content,
+    created_at: m.created_at,
+  }));
+}
+
 
   // fallback without msg_id
   {
