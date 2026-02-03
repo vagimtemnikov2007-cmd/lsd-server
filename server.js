@@ -23,9 +23,7 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 if (!GEMINI_API_KEY || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  console.error(
-    "❌ Missing ENV: GEMINI_API_KEY / SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY",
-  );
+  console.error("❌ Missing ENV: GEMINI_API_KEY / SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY");
   process.exit(1);
 }
 
@@ -41,10 +39,7 @@ const nowISO = () => new Date().toISOString();
 
 function buildTranscriptFromMessages(msgs) {
   return (msgs || [])
-    .map(
-      (m) =>
-        `${m.role === "assistant" ? "AI" : "User"}: ${safeStr(m.content).trim()}`,
-    )
+    .map((m) => `${m.role === "assistant" ? "AI" : "User"}: ${safeStr(m.content).trim()}`)
     .filter(Boolean)
     .join("\n");
 }
@@ -55,12 +50,10 @@ function extractCards(text) {
   const s = text.indexOf(START);
   const e = text.indexOf(END);
 
-  if (s === -1 || e === -1 || e <= s)
-    return { cleanText: text.trim(), cards: [], ok: false };
+  if (s === -1 || e === -1 || e <= s) return { cleanText: text.trim(), cards: [], ok: false };
 
   const jsonBlock = text.slice(s + START.length, e).trim();
-  const cleanText =
-    (text.slice(0, s) + text.slice(e + END.length)).trim() || text.trim();
+  const cleanText = (text.slice(0, s) + text.slice(e + END.length)).trim() || text.trim();
 
   try {
     const parsed = JSON.parse(jsonBlock);
@@ -72,7 +65,8 @@ function extractCards(text) {
 }
 
 async function callGemini(prompt) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
+  const url =
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
 
   const r = await fetch(url, {
     method: "POST",
@@ -84,17 +78,11 @@ async function callGemini(prompt) {
   });
 
   const json = await r.json();
-  if (!r.ok) {
-    throw new Error(json?.error?.message || `gemini_error_${r.status}`);
-  }
+  if (!r.ok) throw new Error(json?.error?.message || `gemini_error_${r.status}`);
 
-  const out =
-    json?.candidates?.[0]?.content?.parts
-      ?.map((p) => p.text || "")
-      .join("")
-      .trim() || "";
-
-  return out;
+  return (
+    json?.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("").trim() || ""
+  );
 }
 
 // =========================
@@ -133,7 +121,7 @@ async function getOrCreateChat(tg_id, chat_id, title = "Чат") {
 
   const { data: created, error: e2 } = await supabase
     .from("lsd_chats")
-    .insert({ tg_id, chat_id, title })
+    .insert({ tg_id, chat_id, title, updated_at: nowISO() })
     .select("*")
     .single();
 
@@ -141,14 +129,17 @@ async function getOrCreateChat(tg_id, chat_id, title = "Чат") {
   return created;
 }
 
-async function insertMessage({ tg_id, chat_id, role, content }) {
-  const { error } = await supabase.from("lsd_messages").insert({
+async function insertMessage({ tg_id, chat_id, msg_id, role, content, created_at }) {
+  const row = {
     tg_id,
     chat_id,
+    msg_id: safeStr(msg_id) || null,
     role, // "user" | "assistant"
     content,
-    created_at: nowISO(),
-  });
+    created_at: created_at || nowISO(),
+  };
+
+  const { error } = await supabase.from("lsd_messages").insert(row);
   if (error) throw error;
 }
 
@@ -165,6 +156,17 @@ async function loadChatMessages({ tg_id, chat_id, limit = 80 }) {
   return data || [];
 }
 
+async function touchChatUpdatedAt(tg_id, chat_id) {
+  const { error } = await supabase
+    .from("lsd_chats")
+    .update({ updated_at: nowISO() })
+    .eq("tg_id", tg_id)
+    .eq("chat_id", chat_id);
+
+  if (error) throw error;
+}
+
+// ---- SYNC helpers ----
 async function upsertChats(tg_id, chats) {
   if (!Array.isArray(chats) || chats.length === 0) return;
 
@@ -174,7 +176,7 @@ async function upsertChats(tg_id, chats) {
       chat_id: safeStr(c.chat_id),
       title: safeStr(c.title) || "Чат",
       emoji: safeStr(c.emoji) || null,
-      updated_at: c.updated_at ? String(c.updated_at) : nowISO(),
+      updated_at: safeStr(c.updated_at) || nowISO(),
     }))
     .filter((r) => r.chat_id);
 
@@ -190,37 +192,32 @@ async function upsertChats(tg_id, chats) {
 async function upsertMessages(tg_id, messages) {
   if (!Array.isArray(messages) || messages.length === 0) return;
 
+  // ожидаем формат:
+  // { chat_id, msg_id, role, content, created_at }
   const rows = messages
     .map((m) => ({
       tg_id,
       chat_id: safeStr(m.chat_id),
-      msg_id: safeStr(m.msg_id) || null,
-      role: safeStr(m.role), // "user" | "assistant"
+      msg_id: safeStr(m.msg_id),
+      role: safeStr(m.role),
       content: safeStr(m.content),
-      created_at: m.created_at ? String(m.created_at) : nowISO(),
+      created_at: safeStr(m.created_at) || nowISO(),
     }))
     .filter(
       (r) =>
-        r.chat_id && (r.role === "user" || r.role === "assistant") && r.content,
+        r.chat_id &&
+        r.msg_id &&
+        (r.role === "user" || r.role === "assistant") &&
+        r.content
     );
 
   if (!rows.length) return;
 
-  // если msg_id есть — upsert, если нет — insert
-  const withId = rows.filter((r) => r.msg_id);
-  const withoutId = rows.filter((r) => !r.msg_id);
+  const { error } = await supabase
+    .from("lsd_messages")
+    .upsert(rows, { onConflict: "tg_id,msg_id" });
 
-  if (withId.length) {
-    const { error } = await supabase
-      .from("lsd_messages")
-      .upsert(withId, { onConflict: "tg_id,msg_id" });
-    if (error) throw error;
-  }
-
-  if (withoutId.length) {
-    const { error } = await supabase.from("lsd_messages").insert(withoutId);
-    if (error) throw error;
-  }
+  if (error) throw error;
 }
 
 async function saveTasksState(tg_id, state) {
@@ -230,7 +227,7 @@ async function saveTasksState(tg_id, state) {
     .from("lsd_tasks_state")
     .upsert(
       { tg_id, state: payload, updated_at: nowISO() },
-      { onConflict: "tg_id" },
+      { onConflict: "tg_id" }
     );
 
   if (error) throw error;
@@ -253,13 +250,13 @@ async function listChats(tg_id) {
     .select("chat_id,title,emoji,updated_at")
     .eq("tg_id", tg_id)
     .order("updated_at", { ascending: false })
-    .limit(50);
+    .limit(100);
 
   if (error) throw error;
   return data || [];
 }
 
-async function listMessages(tg_id, sinceISO = null, limit = 500) {
+async function listMessages(tg_id, sinceISO = null, limit = 2000) {
   let q = supabase
     .from("lsd_messages")
     .select("chat_id,msg_id,role,content,created_at")
@@ -281,52 +278,6 @@ async function listMessages(tg_id, sinceISO = null, limit = 500) {
   }));
 }
 
-let syncTimer = null;
-
-function scheduleSyncPush() {
-  clearTimeout(syncTimer);
-  syncTimer = setTimeout(syncPush, 600); // 0.6s
-}
-
-async function syncPush() {
-  const tg_id = getTgIdOrNull();
-  if (!tg_id) return;
-
-  // берём только то, что реально надо: чаты + задачи + последние сообщения
-  const chats_upsert = (chatsIndex || []).map((id) => {
-    const c = chatCache[id];
-    return {
-      chat_id: id,
-      title: c?.meta?.title || "Новый чат",
-      emoji: c?.meta?.emoji || "💬",
-      updated_at: new Date(c?.meta?.updatedAt || Date.now()).toISOString(),
-    };
-  });
-
-  // сообщения: можно слать только новые,
-  // но для простоты: шлём последние 50 на каждый чат (временно)
-  const messages_upsert = [];
-  (chatsIndex || []).forEach((id) => {
-    const arr = (chatCache[id]?.messages || []).slice(-50);
-    arr.forEach((m) => {
-      messages_upsert.push({
-        chat_id: id,
-        msg_id: m.msg_id || (m.msg_id = uuid()),
-        who: m.who,
-        text: m.text,
-        ts: new Date(m.ts || Date.now()).toISOString(),
-      });
-    });
-  });
-
-  await postJSON(`${API_BASE}/api/sync/push`, {
-    tg_id,
-    chats_upsert,
-    messages_upsert,
-    tasks_state: tasksState,
-  });
-}
-
 // =========================
 // API: CHAT SEND
 // =========================
@@ -337,26 +288,17 @@ app.post("/api/chat/send", async (req, res) => {
     const text = safeStr(req.body?.text).trim();
     const profile = req.body?.profile || {};
 
-    if (!Number.isFinite(tg_id))
-      return res.status(400).json({ error: "tg_id_required" });
+    if (!Number.isFinite(tg_id)) return res.status(400).json({ error: "tg_id_required" });
     if (!chat_id) return res.status(400).json({ error: "chat_id_required" });
     if (!text) return res.status(400).json({ error: "text_required" });
 
     const user = await getOrCreateUser(tg_id);
-
-    // ensure chat exists
     await getOrCreateChat(tg_id, chat_id, text.slice(0, 32) || "Чат");
 
-    // save user msg
+    // сохраняем user msg (msg_id пусть генерит фронт для синка, тут можно без него)
     await insertMessage({ tg_id, chat_id, role: "user", content: text });
+    await touchChatUpdatedAt(tg_id, chat_id);
 
-    await supabase
-      .from("lsd_chats")
-      .update({ updated_at: nowISO() })
-      .eq("tg_id", tg_id)
-      .eq("chat_id", chat_id);
-
-    // load history from DB
     const msgs = await loadChatMessages({ tg_id, chat_id, limit: 80 });
     const transcript = buildTranscriptFromMessages(msgs);
 
@@ -386,13 +328,8 @@ ${text}
 
     const answer = await callGemini(prompt);
 
-    // save assistant msg
-    await insertMessage({
-      tg_id,
-      chat_id,
-      role: "assistant",
-      content: answer || "",
-    });
+    await insertMessage({ tg_id, chat_id, role: "assistant", content: answer || "" });
+    await touchChatUpdatedAt(tg_id, chat_id);
 
     return res.json({
       ok: true,
@@ -402,9 +339,7 @@ ${text}
     });
   } catch (e) {
     console.error("CHAT ERROR:", e);
-    return res
-      .status(500)
-      .json({ error: "server_error", details: String(e.message || e) });
+    return res.status(500).json({ error: "server_error", details: String(e.message || e) });
   }
 });
 
@@ -417,25 +352,20 @@ app.post("/api/plan/create", async (req, res) => {
     const chat_id = safeStr(req.body?.chat_id);
     const profile = req.body?.profile || {};
 
-    if (!Number.isFinite(tg_id))
-      return res.status(400).json({ error: "tg_id_required" });
+    if (!Number.isFinite(tg_id)) return res.status(400).json({ error: "tg_id_required" });
     if (!chat_id) return res.status(400).json({ error: "chat_id_required" });
 
     const user = await getOrCreateUser(tg_id);
     const tier = safeStr(user?.tier) || "free";
     const plansLeft = Number.isFinite(user?.plans_left) ? user.plans_left : 0;
 
-    // limit check
     if (tier !== "developer" && plansLeft <= 0) {
-      return res
-        .status(403)
-        .json({ error: "no_plans_left", plans_left: plansLeft, tier });
+      return res.status(403).json({ error: "no_plans_left", plans_left: plansLeft, tier });
     }
 
     const msgs = await loadChatMessages({ tg_id, chat_id, limit: 120 });
     const transcript = buildTranscriptFromMessages(msgs);
-    if (!transcript.trim())
-      return res.json({ cards: [], text: "", tier, plans_left: plansLeft });
+    if (!transcript.trim()) return res.json({ cards: [], text: "", tier, plans_left: plansLeft });
 
     const profileBlock = `
 Профиль пользователя:
@@ -470,37 +400,16 @@ ${transcript}
     const parsed = extractCards(raw);
 
     if (!parsed.ok) {
-      return res.json({
-        cards: [],
-        text: parsed.cleanText,
-        tier,
-        plans_left: plansLeft,
-        error: "plan_json_invalid",
-      });
+      return res.json({ cards: [], text: parsed.cleanText, tier, plans_left: plansLeft, error: "plan_json_invalid" });
     }
 
-    // save plan (and consume if needed)
-    const payload = {
-      cards: parsed.cards,
-      text: parsed.cleanText,
-      created_at: nowISO(),
-      chat_id,
-    };
+    const payload = { cards: parsed.cards, text: parsed.cleanText, created_at: nowISO(), chat_id };
 
     if (tier === "developer") {
-      await supabase
-        .from("lsd_users")
-        .update({ current_plan: payload })
-        .eq("tg_id", tg_id);
-      return res.json({
-        cards: parsed.cards,
-        text: parsed.cleanText,
-        tier,
-        plans_left: plansLeft,
-      });
+      await supabase.from("lsd_users").update({ current_plan: payload }).eq("tg_id", tg_id);
+      return res.json({ cards: parsed.cards, text: parsed.cleanText, tier, plans_left: plansLeft });
     }
 
-    // consume using your RPC if you have it
     const { data, error } = await supabase.rpc("consume_plan_and_save", {
       p_tg_id: tg_id,
       p_plan: payload,
@@ -508,101 +417,53 @@ ${transcript}
 
     if (error) {
       console.error("RPC consume_plan_and_save ERROR:", error);
-
-      // твои RAISE EXCEPTION из plpgsql обычно приходят как P0001
       if (error.code === "P0001") {
         const msg = String(error.message || "");
-
-        if (msg.includes("no_plans_left")) {
-          return res.status(403).json({
-            error: "no_plans_left",
-            tier,
-            plans_left: plansLeft,
-          });
-        }
-
-        if (msg.includes("user_not_found")) {
-          return res.status(404).json({
-            error: "user_not_found",
-          });
-        }
-
-        // неизвестная P0001, но всё равно это "логическая" ошибка
-        return res.status(400).json({
-          error: "plan_consume_failed",
-          details: msg,
-        });
+        if (msg.includes("no_plans_left")) return res.status(403).json({ error: "no_plans_left", tier, plans_left: plansLeft });
+        if (msg.includes("user_not_found")) return res.status(404).json({ error: "user_not_found" });
+        return res.status(400).json({ error: "plan_consume_failed", details: msg });
       }
-
-      // все остальные ошибки — серверные
-      return res.status(500).json({
-        error: "server_error",
-        details: String(error.message || error),
-      });
+      return res.status(500).json({ error: "server_error", details: String(error.message || error) });
     }
 
-    // data может быть объектом или массивом (зависит от функции)
     const row = Array.isArray(data) ? data[0] : data;
-
-    return res.json({
-      cards: parsed.cards,
-      text: parsed.cleanText,
-      tier,
-      plans_left: row?.plans_left ?? 0,
-    });
+    return res.json({ cards: parsed.cards, text: parsed.cleanText, tier, plans_left: row?.plans_left ?? 0 });
   } catch (e) {
     console.error("PLAN ERROR:", e);
-    return res
-      .status(500)
-      .json({ error: "server_error", details: String(e.message || e) });
+    return res.status(500).json({ error: "server_error", details: String(e.message || e) });
   }
 });
 
 // =========================
-// API: USER INIT (create user on app open)
+// API: USER INIT
 // =========================
 app.post("/api/user/init", async (req, res) => {
   try {
     const tg_id = Number(req.body?.tg_id);
-    const profile = req.body?.profile || {};
-
-    if (!Number.isFinite(tg_id)) {
-      return res.status(400).json({ error: "tg_id_required" });
-    }
+    if (!Number.isFinite(tg_id)) return res.status(400).json({ error: "tg_id_required" });
 
     const user = await getOrCreateUser(tg_id);
-
-    return res.json({
-      ok: true,
-      tier: user.tier,
-      plans_left: user.plans_left,
-    });
+    return res.json({ ok: true, tier: user.tier, plans_left: user.plans_left });
   } catch (e) {
     console.error("USER INIT ERROR:", e);
-    return res.status(500).json({
-      error: "server_error",
-      details: String(e.message || e),
-    });
+    return res.status(500).json({ error: "server_error", details: String(e.message || e) });
   }
 });
+
 // =========================
 // API: SYNC PULL
 // =========================
 app.post("/api/sync/pull", async (req, res) => {
   try {
     const tg_id = Number(req.body?.tg_id);
-    const since = safeStr(req.body?.since || ""); // optional ISO string
+    const since = safeStr(req.body?.since || ""); // optional ISO
 
-    if (!Number.isFinite(tg_id))
-      return res.status(400).json({ error: "tg_id_required" });
+    if (!Number.isFinite(tg_id)) return res.status(400).json({ error: "tg_id_required" });
 
     await getOrCreateUser(tg_id);
 
-    // ensure main chat exists (shared across devices)
-    await getOrCreateChat(tg_id, "main", "Основной чат");
-
     const chats = await listChats(tg_id);
-    const messages = await listMessages(tg_id, since || null, 800);
+    const messages = await listMessages(tg_id, since || null, 2000);
     const tasks_state = await loadTasksState(tg_id);
 
     return res.json({
@@ -614,9 +475,7 @@ app.post("/api/sync/pull", async (req, res) => {
     });
   } catch (e) {
     console.error("SYNC PULL ERROR:", e);
-    return res
-      .status(500)
-      .json({ error: "server_error", details: String(e.message || e) });
+    return res.status(500).json({ error: "server_error", details: String(e.message || e) });
   }
 });
 
@@ -630,28 +489,19 @@ app.post("/api/sync/push", async (req, res) => {
     const messages_upsert = req.body?.messages_upsert;
     const tasks_state = req.body?.tasks_state;
 
-    if (!Number.isFinite(tg_id))
-      return res.status(400).json({ error: "tg_id_required" });
+    if (!Number.isFinite(tg_id)) return res.status(400).json({ error: "tg_id_required" });
 
     await getOrCreateUser(tg_id);
 
-    // upsert chats meta
     await upsertChats(tg_id, chats_upsert);
-
-    // upsert messages
     await upsertMessages(tg_id, messages_upsert);
 
-    // save tasks
-    if (tasks_state) {
-      await saveTasksState(tg_id, tasks_state);
-    }
+    if (tasks_state) await saveTasksState(tg_id, tasks_state);
 
     return res.json({ ok: true, server_time: nowISO() });
   } catch (e) {
     console.error("SYNC PUSH ERROR:", e);
-    return res
-      .status(500)
-      .json({ error: "server_error", details: String(e.message || e) });
+    return res.status(500).json({ error: "server_error", details: String(e.message || e) });
   }
 });
 
