@@ -1107,10 +1107,8 @@ app.post("/api/subscription/invoice", async (req, res) => {
     if (!Number.isFinite(tg_id)) return res.status(400).json({ error: "tg_id_required" });
     if (plan !== "month" && plan !== "year") return res.status(400).json({ error: "invalid_plan" });
 
-    // Stars prices
     const PRICE_STARS = plan === "year" ? 1990 : 199;
 
-    // payload мы потом читаем в webhook
     const payload = JSON.stringify({
       tg_id,
       plan,
@@ -1119,21 +1117,25 @@ app.post("/api/subscription/invoice", async (req, res) => {
       nonce: uuid(),
     });
 
-    return res.json({
-      ok: true,
-      invoice: {
-        title: "LSD Premium",
-        description: plan === "year" ? "Подписка LSD Premium на 1 год" : "Подписка LSD Premium на 1 месяц",
-        currency: "XTR",
-        prices: [{ label: plan === "year" ? "LSD Premium (год)" : "LSD Premium (месяц)", amount: PRICE_STARS }],
-        payload,
-      },
+    // ⭐ создаём ссылку на инвойс
+    const invoice_url = await tgApi("createInvoiceLink", {
+      title: "LSD Premium",
+      description: plan === "year" ? "Подписка LSD Premium на 1 год" : "Подписка LSD Premium на 1 месяц",
+      payload,
+      currency: "XTR",
+      prices: [
+        { label: plan === "year" ? "LSD Premium (год)" : "LSD Premium (месяц)", amount: PRICE_STARS }
+      ],
+      // provider_token для Stars не нужен
     });
+
+    return res.json({ ok: true, invoice_url });
   } catch (e) {
     console.error("INVOICE ERROR:", e);
     return res.status(500).json({ error: "server_error", details: String(e?.message || e) });
   }
 });
+
 
 // -------------------------
 // OPTIONAL: quota worker (не обязателен, но полезен)
