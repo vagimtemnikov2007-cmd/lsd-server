@@ -483,21 +483,24 @@ app.post("/api/chat/attach", upload.single("file"), async (req, res) => {
   try {
     const tg_id = Number(req.body?.tg_id);
     const chat_id = safeStr(req.body?.chat_id);
-    const kind = safeStr(req.body?.kind); // "photo" | "file"
-    const profileRaw = safeStr(req.body?.profile || "{}");
+    const kind = safeStr(req.body?.kind);
+
+    // profile: супер безопасно
     let profile = {};
-    try { profile = JSON.parse(profileRaw || "{}"); } catch { profile = {}; }
+    const profileRaw = req.body?.profile;
+    if (typeof profileRaw === "string" && profileRaw.trim()) {
+      try { profile = JSON.parse(profileRaw); } catch { profile = {}; }
+    }
 
     const file = req.file;
 
-    if (!Number.isFinite(tg_id)) return res.status(400).json({ error: "tg_id_required" });
-    if (!chat_id) return res.status(400).json({ error: "chat_id_required" });
-    if (!file) return res.status(400).json({ error: "file_required" });
+    if (!Number.isFinite(tg_id)) return res.status(400).json({ ok: false, error: "tg_id_required" });
+    if (!chat_id) return res.status(400).json({ ok: false, error: "chat_id_required" });
+    if (!file) return res.status(400).json({ ok: false, error: "file_required" });
 
     const user = await getOrCreateUser(tg_id);
     await getOrCreateChat(tg_id, chat_id, "Чат", "💬");
 
-    // 1) сохраняем "сообщение пользователя" в БД (как в чате)
     const label =
       kind === "photo"
         ? `📷 Фото: ${file.originalname || "image"}`
@@ -507,7 +510,6 @@ app.post("/api/chat/attach", upload.single("file"), async (req, res) => {
     await insertMessage({ tg_id, chat_id, msg_id: user_msg_id, role: "user", content: label });
     await touchChatUpdatedAt(tg_id, chat_id);
 
-    // 2) строим контекст (история)
     const msgs = await loadChatMessages({ tg_id, chat_id, limit: 60 });
     const transcript = buildTranscriptFromMessages(msgs);
 
@@ -518,7 +520,6 @@ age: ${profile?.age ?? ""}
 bio: ${profile?.bio || ""}
 `.trim();
 
-    // 3) если это картинка — отправляем vision в Gemini
     const isImage = /^image\//i.test(file.mimetype || "");
     let answer = "";
 
@@ -534,15 +535,14 @@ bio: ${profile?.bio || ""}
 Правила:
 - отвечай на русском
 - кратко и по делу
-- если на изображении текст/таблица — кратко перескажи и предложи следующий шаг
 - не создавай JSON-планы
 
 ${profileBlock}
 
-История чата:
+История:
 ${transcript}
 
-Задача: проанализируй изображение и ответь пользователю.
+Ответь пользователю по изображению.
 `.trim(),
         },
         {
@@ -555,14 +555,12 @@ ${transcript}
 
       answer = await callGeminiParts(parts, { temperature: 0.2 });
     } else {
-      // НЕ-картинки: пока без парсинга pdf/doc — честно просим текст
       answer =
         `Я получил файл "${file.originalname}". ` +
-        `Пока я умею анализировать здесь только **фото/картинки**. ` +
-        `Если это документ — вставь сюда текст из файла, и я помогу.`;
+        `Пока умею анализировать только фото/картинки. ` +
+        `Если это документ — вставь сюда текст из него.`;
     }
 
-    // 4) сохраняем ответ ассистента
     const ai_msg_id = uuid();
     await insertMessage({ tg_id, chat_id, msg_id: ai_msg_id, role: "assistant", content: answer || "" });
     await touchChatUpdatedAt(tg_id, chat_id);
@@ -575,12 +573,25 @@ ${transcript}
       tier: user.tier,
       plans_left: user.plans_left,
       server_time: nowISO(),
+      debug: {
+        kind,
+        mimetype: file.mimetype,
+        size: file.size,
+        name: file.originalname,
+      },
     });
   } catch (e) {
     console.error("ATTACH ERROR:", e);
-    return res.status(500).json({ error: "server_error", details: String(e.message || e) });
+
+    // ВСЕГДА JSON, чтобы фронт не ловил bad_json_from_server
+    return res.status(500).json({
+      ok: false,
+      error: "server_error",
+      details: String(e?.message || e),
+    });
   }
 });
+
 
 // -------------------------
 // API: PLAN CREATE
