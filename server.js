@@ -48,6 +48,17 @@ const safeStr = (x) => (typeof x === "string" ? x : "");
 const nowISO = () => new Date().toISOString();
 const uuid = () => (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}_${Math.random()}`);
 
+function isPremiumActive(user) {
+  const until = user?.premium_until ? new Date(user.premium_until).getTime() : 0;
+  return !!until && until > Date.now();
+}
+
+function effectiveTier(user) {
+  const t = safeStr(user?.tier).toLowerCase();
+  if (t === "developer") return "developer";
+  return isPremiumActive(user) ? "premium" : "free";
+}
+
 async function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -156,8 +167,9 @@ async function getOrCreateUserAndFreshen(tg_id) {
   // 4) if due -> reset
   const due = Date.now() >= new Date(user.quota_next_reset_at).getTime();
   if (due) {
-    const tier = tierNorm(user.tier);
-    const lim = DAILY_LIMITS[tier];
+const tier = effectiveTier(user);
+const lim = DAILY_LIMITS[tier];
+
 
     const patch = {
       quota_next_reset_at: nextAlmatyMidnightISO(new Date()),
@@ -187,8 +199,9 @@ async function getOrCreateUserAndFreshen(tg_id) {
  */
 async function consumeQuota(tg_id, kind /* "plans" | "media" */) {
   const user = await getOrCreateUserAndFreshen(tg_id);
-  const tier = tierNorm(user.tier);
-  const lim = DAILY_LIMITS[tier];
+const tier = effectiveTier(user);
+const lim = DAILY_LIMITS[tier];
+
 
   const reset = resetInfo(user.quota_next_reset_at);
 
@@ -611,7 +624,7 @@ ${text}
       text: answer || "",
       user_msg_id,
       ai_msg_id,
-      tier: tierNorm(user.tier),
+      tier: effectiveTier(user),
       plans_left: Number.isFinite(user.plans_left) ? user.plans_left : 0,
       media_left: Number.isFinite(user.media_left) ? user.media_left : 0,
       ...reset,
@@ -728,7 +741,7 @@ ${transcript}
       text: answer || "",
       user_msg_id,
       ai_msg_id,
-      tier: tierNorm(user.tier),
+      tier: effectiveTier(user),
       plans_left: Number.isFinite(user.plans_left) ? user.plans_left : 0,
       media_left: Number.isFinite(user.media_left) ? user.media_left : 0,
       ...q.reset,
@@ -889,7 +902,7 @@ app.post("/api/sync/pull", async (req, res) => {
       chats,
       messages,
       tasks_state,
-      tier: tierNorm(user.tier),
+      tier: effectiveTier(user),
       plans_left: Number.isFinite(user.plans_left) ? user.plans_left : 0,
       media_left: Number.isFinite(user.media_left) ? user.media_left : 0,
       ...reset,
