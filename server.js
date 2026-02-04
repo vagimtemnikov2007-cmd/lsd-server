@@ -34,7 +34,7 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   process.exit(1);
 }
 if (!GEMINI_API_KEY) {
-  console.warn("⚠️ GEMINI_API_KEY is missing — /api/chat/send and /api/plan/create will fail.");
+  console.warn("⚠️ GEMINI_API_KEY is missing — chat/plan/media endpoints will fail.");
 }
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
@@ -53,18 +53,182 @@ async function sleep(ms) {
 }
 
 // -------------------------
+// Daily quotas (Almaty midnight)
+// -------------------------
+// Asia/Almaty ~ UTC+5 (обычно без DST). Нам нужна "полночь Алматы".
+const RESET_TZ_OFFSET_MIN = 5 * 60;
+
+// Лимиты в день (можешь менять)
+const DAILY_LIMITS = {
+  free: { plans: 3, media: 3 },
+  premium: { plans: 30, media: 30 },
+  developer: { plans: Infinity, media: Infinity },
+};
+
+function tierNorm(tier) {
+  const t = safeStr(tier).toLowerCase();
+  return t === "premium" || t === "developer" ? t : "free";
+}
+
+function nextAlmatyMidnightISO(fromDate = new Date()) {
+  const ms = fromDate.getTime();
+  const local = new Date(ms + RESET_TZ_OFFSET_MIN * 60 * 1000);
+  const next = new Date(local);
+  next.setHours(24, 0, 0, 0); // следующая полночь локальная
+  const utcMs = next.getTime() - RESET_TZ_OFFSET_MIN * 60 * 1000;
+  return new Date(utcMs).toISOString();
+}
+
+function msUntil(iso) {
+  const t = new Date(iso).getTime();
+  return Math.max(0, t - Date.now());
+}
+
+function fmtMsLeft(ms) {
+  const s = Math.floor(ms / 1000);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  if (h > 0) return `${h}ч ${m}м`;
+  if (m > 0) return `${m}м ${sec}с`;
+  return `${sec}с`;
+}
+
+function resetInfo(reset_at) {
+  const iso = safeStr(reset_at) || nextAlmatyMidnightISO(new Date());
+  const ms = msUntil(iso);
+  return {
+    quota_reset_at: iso,
+    quota_reset_in_sec: Math.ceil(ms / 1000),
+    quota_reset_in_human: fmtMsLeft(ms),
+    quota_reset_at_local: new Date(iso).toLocaleString("ru-RU", { timeZone: "Asia/Almaty" }),
+  };
+}
+
+/**
+ * Ensure user exists + ensure quotas not expired.
+ * If expired -> reset plans_left/media_left based on tier + set next reset.
+ */
+async function getOrCreateUserAndFreshen(tg_id) {
+  // 1) try load
+  const { data: existing, error } = await supabase
+    .from("lsd_users")
+    .select("*")
+    .eq("tg_id", tg_id)
+    .maybeSingle();
+
+  if (error) throw error;
+
+  const nextReset = nextAlmatyMidnightISO(new Date());
+
+  // 2) create if missing
+  if (!existing) {
+    const limits = DAILY_LIMITS.free;
+    const { data: created, error: e2 } = await supabase
+      .from("lsd_users")
+      .insert({
+        tg_id,
+        tier: "free",
+        plans_left: limits.plans,
+        media_left: limits.media,
+        quota_next_reset_at: nextReset,
+        updated_at: nowISO(),
+      })
+      .select("*")
+      .single();
+    if (e2) throw e2;
+    return created;
+  }
+
+  // 3) if missing quota_next_reset_at -> set it
+  let user = existing;
+  if (!user.quota_next_reset_at) {
+    const { data: patched, error: e3 } = await supabase
+      .from("lsd_users")
+      .update({ quota_next_reset_at: nextReset, updated_at: nowISO() })
+      .eq("tg_id", tg_id)
+      .select("*")
+      .single();
+    if (e3) throw e3;
+    user = patched;
+  }
+
+  // 4) if due -> reset
+  const due = Date.now() >= new Date(user.quota_next_reset_at).getTime();
+  if (due) {
+    const tier = tierNorm(user.tier);
+    const lim = DAILY_LIMITS[tier];
+
+    const patch = {
+      quota_next_reset_at: nextAlmatyMidnightISO(new Date()),
+      updated_at: nowISO(),
+    };
+
+    // developer: можно оставить как есть (но логичнее держать "очень большое" или null)
+    if (Number.isFinite(lim.plans)) patch.plans_left = lim.plans;
+    if (Number.isFinite(lim.media)) patch.media_left = lim.media;
+
+    const { data: updated, error: e4 } = await supabase
+      .from("lsd_users")
+      .update(patch)
+      .eq("tg_id", tg_id)
+      .select("*")
+      .single();
+    if (e4) throw e4;
+    return updated;
+  }
+
+  return user;
+}
+
+/**
+ * Consume quota: "plans" or "media" (decrement by 1), only if not developer/unlimited.
+ * Returns fresh user (after update).
+ */
+async function consumeQuota(tg_id, kind /* "plans" | "media" */) {
+  const user = await getOrCreateUserAndFreshen(tg_id);
+  const tier = tierNorm(user.tier);
+  const lim = DAILY_LIMITS[tier];
+
+  const reset = resetInfo(user.quota_next_reset_at);
+
+  if (tier === "developer" || !Number.isFinite(lim[kind])) {
+    return { ok: true, user, reset };
+  }
+
+  const leftField = kind === "media" ? "media_left" : "plans_left";
+  const left = Number.isFinite(user[leftField]) ? user[leftField] : 0;
+
+  if (left <= 0) {
+    return {
+      ok: false,
+      error: kind === "media" ? "no_media_left" : "no_plans_left",
+      user,
+      reset,
+    };
+  }
+
+  const { data: updated, error } = await supabase
+    .from("lsd_users")
+    .update({ [leftField]: left - 1, updated_at: nowISO() })
+    .eq("tg_id", tg_id)
+    .select("*")
+    .single();
+
+  if (error) throw error;
+  return { ok: true, user: updated, reset };
+}
+
+// -------------------------
 // Multer (multipart) — memory storage
 // -------------------------
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: {
-    // Telegram mini-app обычно нормально с этим живёт
-    fileSize: 8 * 1024 * 1024, // 8MB
-  },
+  limits: { fileSize: 8 * 1024 * 1024 }, // 8MB
 });
 
 // -------------------------
-// Gemini (TEXT)
+// Gemini helpers
 // -------------------------
 async function callGeminiText(prompt) {
   if (!GEMINI_API_KEY) throw new Error("missing_gemini_api_key");
@@ -101,9 +265,6 @@ async function callGeminiText(prompt) {
   return "Сейчас слишком много запросов (лимит API). Попробуй через минуту 🙂";
 }
 
-// -------------------------
-// Gemini (PARTS) — text + inlineData (vision)
-// -------------------------
 async function callGeminiParts(parts, { temperature = 0.4 } = {}) {
   if (!GEMINI_API_KEY) throw new Error("missing_gemini_api_key");
 
@@ -170,28 +331,8 @@ function buildTranscriptFromMessages(msgs) {
 }
 
 // -------------------------
-// DB helpers
+// DB helpers: chats/messages/tasks
 // -------------------------
-async function getOrCreateUser(tg_id) {
-  const { data, error } = await supabase
-    .from("lsd_users")
-    .select("*")
-    .eq("tg_id", tg_id)
-    .maybeSingle();
-
-  if (error) throw error;
-  if (data) return data;
-
-  const { data: created, error: e2 } = await supabase
-    .from("lsd_users")
-    .insert({ tg_id, tier: "free", plans_left: 0, updated_at: nowISO() })
-    .select("*")
-    .single();
-
-  if (e2) throw e2;
-  return created;
-}
-
 async function getOrCreateChat(tg_id, chat_id, title = "Чат", emoji = "💬") {
   const { data, error } = await supabase
     .from("lsd_chats")
@@ -250,7 +391,7 @@ async function loadChatMessages({ tg_id, chat_id, limit = 120 }) {
   return data || [];
 }
 
-// ---- sync tables ----
+// sync
 async function listChats(tg_id) {
   const { data, error } = await supabase
     .from("lsd_chats")
@@ -355,7 +496,7 @@ async function upsertMessages(tg_id, messages) {
   }
 }
 
-// ---- tasks state (optional table) ----
+// tasks state
 async function loadTasksState(tg_id) {
   const { data, error } = await supabase
     .from("lsd_tasks_state")
@@ -390,12 +531,17 @@ app.post("/api/user/init", async (req, res) => {
     const tg_id = Number(req.body?.tg_id);
     if (!Number.isFinite(tg_id)) return res.status(400).json({ error: "tg_id_required" });
 
-    const user = await getOrCreateUser(tg_id);
+    const user = await getOrCreateUserAndFreshen(tg_id);
+    const tier = tierNorm(user.tier);
+    const reset = resetInfo(user.quota_next_reset_at);
+
     return res.json({
       ok: true,
       tg_id,
-      tier: user.tier,
-      plans_left: user.plans_left,
+      tier,
+      plans_left: Number.isFinite(user.plans_left) ? user.plans_left : 0,
+      media_left: Number.isFinite(user.media_left) ? user.media_left : 0,
+      ...reset,
       server_time: nowISO(),
     });
   } catch (e) {
@@ -405,7 +551,7 @@ app.post("/api/user/init", async (req, res) => {
 });
 
 // -------------------------
-// API: CHAT SEND (text)
+// API: CHAT SEND (TEXT) - НЕ тратит лимиты
 // -------------------------
 app.post("/api/chat/send", async (req, res) => {
   try {
@@ -419,10 +565,9 @@ app.post("/api/chat/send", async (req, res) => {
     if (!chat_id) return res.status(400).json({ error: "chat_id_required" });
     if (!text) return res.status(400).json({ error: "text_required" });
 
-    const user = await getOrCreateUser(tg_id);
+    const user = await getOrCreateUserAndFreshen(tg_id);
     await getOrCreateChat(tg_id, chat_id, "Чат", "💬");
 
-    // save user message
     await insertMessage({ tg_id, chat_id, msg_id: user_msg_id, role: "user", content: text });
     await touchChatUpdatedAt(tg_id, chat_id);
 
@@ -459,13 +604,17 @@ ${text}
     await insertMessage({ tg_id, chat_id, msg_id: ai_msg_id, role: "assistant", content: answer || "" });
     await touchChatUpdatedAt(tg_id, chat_id);
 
+    const reset = resetInfo(user.quota_next_reset_at);
+
     return res.json({
       ok: true,
       text: answer || "",
       user_msg_id,
       ai_msg_id,
-      tier: user.tier,
-      plans_left: user.plans_left,
+      tier: tierNorm(user.tier),
+      plans_left: Number.isFinite(user.plans_left) ? user.plans_left : 0,
+      media_left: Number.isFinite(user.media_left) ? user.media_left : 0,
+      ...reset,
       server_time: nowISO(),
     });
   } catch (e) {
@@ -475,9 +624,7 @@ ${text}
 });
 
 // -------------------------
-// API: CHAT ATTACH (photo/file) ✅
-// ожидает multipart/form-data:
-// tg_id, chat_id, kind, profile (json string), file
+// API: CHAT ATTACH (PHOTO/FILE) - ТРАТИТ MEDIA лимит
 // -------------------------
 app.post("/api/chat/attach", upload.single("file"), async (req, res) => {
   try {
@@ -485,7 +632,6 @@ app.post("/api/chat/attach", upload.single("file"), async (req, res) => {
     const chat_id = safeStr(req.body?.chat_id);
     const kind = safeStr(req.body?.kind);
 
-    // profile: супер безопасно
     let profile = {};
     const profileRaw = req.body?.profile;
     if (typeof profileRaw === "string" && profileRaw.trim()) {
@@ -498,7 +644,22 @@ app.post("/api/chat/attach", upload.single("file"), async (req, res) => {
     if (!chat_id) return res.status(400).json({ ok: false, error: "chat_id_required" });
     if (!file) return res.status(400).json({ ok: false, error: "file_required" });
 
-    const user = await getOrCreateUser(tg_id);
+    // consume media quota (если free/premium)
+    const q = await consumeQuota(tg_id, "media");
+    if (!q.ok) {
+      return res.status(403).json({
+        ok: false,
+        error: q.error, // no_media_left
+        tier: tierNorm(q.user.tier),
+        media_left: Number.isFinite(q.user.media_left) ? q.user.media_left : 0,
+        plans_left: Number.isFinite(q.user.plans_left) ? q.user.plans_left : 0,
+        ...q.reset,
+        message_ru: `Лимит медиа на сегодня закончился. Сброс через ${q.reset.quota_reset_in_human} (в ${q.reset.quota_reset_at_local}).`,
+      });
+    }
+
+    const user = q.user;
+
     await getOrCreateChat(tg_id, chat_id, "Чат", "💬");
 
     const label =
@@ -546,10 +707,7 @@ ${transcript}
 `.trim(),
         },
         {
-          inlineData: {
-            mimeType: file.mimetype || "image/png",
-            data: base64,
-          },
+          inlineData: { mimeType: file.mimetype || "image/png", data: base64 },
         },
       ];
 
@@ -570,20 +728,15 @@ ${transcript}
       text: answer || "",
       user_msg_id,
       ai_msg_id,
-      tier: user.tier,
-      plans_left: user.plans_left,
+      tier: tierNorm(user.tier),
+      plans_left: Number.isFinite(user.plans_left) ? user.plans_left : 0,
+      media_left: Number.isFinite(user.media_left) ? user.media_left : 0,
+      ...q.reset,
       server_time: nowISO(),
-      debug: {
-        kind,
-        mimetype: file.mimetype,
-        size: file.size,
-        name: file.originalname,
-      },
+      debug: { kind, mimetype: file.mimetype, size: file.size, name: file.originalname },
     });
   } catch (e) {
     console.error("ATTACH ERROR:", e);
-
-    // ВСЕГДА JSON, чтобы фронт не ловил bad_json_from_server
     return res.status(500).json({
       ok: false,
       error: "server_error",
@@ -592,9 +745,8 @@ ${transcript}
   }
 });
 
-
 // -------------------------
-// API: PLAN CREATE
+// API: PLAN CREATE - ТРАТИТ PLANS лимит (+ сохраняет current_plan)
 // -------------------------
 app.post("/api/plan/create", async (req, res) => {
   try {
@@ -605,17 +757,36 @@ app.post("/api/plan/create", async (req, res) => {
     if (!Number.isFinite(tg_id)) return res.status(400).json({ error: "tg_id_required" });
     if (!chat_id) return res.status(400).json({ error: "chat_id_required" });
 
-    const user = await getOrCreateUser(tg_id);
-    const tier = safeStr(user?.tier) || "free";
-    const plansLeft = Number.isFinite(user?.plans_left) ? user.plans_left : 0;
-
-    if (tier !== "developer" && plansLeft <= 0) {
-      return res.status(403).json({ error: "no_plans_left", tier, plans_left: plansLeft });
+    // consume plans quota
+    const q = await consumeQuota(tg_id, "plans");
+    if (!q.ok) {
+      return res.status(403).json({
+        ok: false,
+        error: q.error, // no_plans_left
+        tier: tierNorm(q.user.tier),
+        plans_left: Number.isFinite(q.user.plans_left) ? q.user.plans_left : 0,
+        media_left: Number.isFinite(q.user.media_left) ? q.user.media_left : 0,
+        ...q.reset,
+        message_ru: `Лимит планов на сегодня закончился. Сброс через ${q.reset.quota_reset_in_human} (в ${q.reset.quota_reset_at_local}).`,
+      });
     }
+
+    const user = q.user;
+    const tier = tierNorm(user.tier);
 
     const msgs = await loadChatMessages({ tg_id, chat_id, limit: 140 });
     const transcript = buildTranscriptFromMessages(msgs);
-    if (!transcript.trim()) return res.json({ ok: true, cards: [], text: "", tier, plans_left: plansLeft });
+    if (!transcript.trim()) {
+      return res.json({
+        ok: true,
+        cards: [],
+        text: "",
+        tier,
+        plans_left: Number.isFinite(user.plans_left) ? user.plans_left : 0,
+        media_left: Number.isFinite(user.media_left) ? user.media_left : 0,
+        ...q.reset,
+      });
+    }
 
     const profileBlock = `
 Профиль пользователя:
@@ -649,62 +820,41 @@ ${transcript}
     const raw = await callGeminiText(prompt);
     const parsed = extractCards(raw);
 
+    const payload = {
+      cards: parsed.ok ? parsed.cards : [],
+      text: parsed.cleanText,
+      created_at: nowISO(),
+      chat_id,
+    };
+
+    // сохраняем current_plan (всем)
+    await supabase
+      .from("lsd_users")
+      .update({ current_plan: payload, updated_at: nowISO() })
+      .eq("tg_id", tg_id);
+
     if (!parsed.ok) {
       return res.json({
         ok: true,
         cards: [],
         text: parsed.cleanText,
         tier,
-        plans_left: plansLeft,
+        plans_left: Number.isFinite(user.plans_left) ? user.plans_left : 0,
+        media_left: Number.isFinite(user.media_left) ? user.media_left : 0,
+        ...q.reset,
         error: "plan_json_invalid",
       });
     }
 
-    const payload = { cards: parsed.cards, text: parsed.cleanText, created_at: nowISO(), chat_id };
-
-    if (tier === "developer") {
-      await supabase.from("lsd_users").update({ current_plan: payload, updated_at: nowISO() }).eq("tg_id", tg_id);
-      return res.json({ ok: true, cards: parsed.cards, text: parsed.cleanText, tier, plans_left: plansLeft });
-    }
-
-    let consumed = false;
-    try {
-      const { data, error } = await supabase.rpc("consume_plan_and_save", {
-        p_tg_id: tg_id,
-        p_plan: payload,
-      });
-      if (error) throw error;
-
-      const row = Array.isArray(data) ? data[0] : data;
-      consumed = true;
-
-      return res.json({
-        ok: true,
-        cards: parsed.cards,
-        text: parsed.cleanText,
-        tier,
-        plans_left: row?.plans_left ?? Math.max(plansLeft - 1, 0),
-      });
-    } catch (e) {
-      console.warn("consume_plan_and_save skipped/fallback:", e?.message || e);
-    }
-
-    if (!consumed) {
-      const newPlansLeft = Math.max(plansLeft - 1, 0);
-      await supabase
-        .from("lsd_users")
-        .update({ current_plan: payload, plans_left: newPlansLeft, updated_at: nowISO() })
-        .eq("tg_id", tg_id);
-
-      return res.json({
-        ok: true,
-        cards: parsed.cards,
-        text: parsed.cleanText,
-        tier,
-        plans_left: newPlansLeft,
-        warning: "rpc_missing_fallback_used",
-      });
-    }
+    return res.json({
+      ok: true,
+      cards: parsed.cards,
+      text: parsed.cleanText,
+      tier,
+      plans_left: Number.isFinite(user.plans_left) ? user.plans_left : 0,
+      media_left: Number.isFinite(user.media_left) ? user.media_left : 0,
+      ...q.reset,
+    });
   } catch (e) {
     console.error("PLAN ERROR:", e);
     return res.status(500).json({ error: "server_error", details: String(e.message || e) });
@@ -721,7 +871,8 @@ app.post("/api/sync/pull", async (req, res) => {
 
     if (!Number.isFinite(tg_id)) return res.status(400).json({ error: "tg_id_required" });
 
-    await getOrCreateUser(tg_id);
+    const user = await getOrCreateUserAndFreshen(tg_id);
+    const reset = resetInfo(user.quota_next_reset_at);
 
     const chats = await listChats(tg_id);
     const messages = await listMessages(tg_id, since || null, 4000);
@@ -738,6 +889,10 @@ app.post("/api/sync/pull", async (req, res) => {
       chats,
       messages,
       tasks_state,
+      tier: tierNorm(user.tier),
+      plans_left: Number.isFinite(user.plans_left) ? user.plans_left : 0,
+      media_left: Number.isFinite(user.media_left) ? user.media_left : 0,
+      ...reset,
       server_time: nowISO(),
     });
   } catch (e) {
@@ -758,7 +913,7 @@ app.post("/api/sync/push", async (req, res) => {
 
     if (!Number.isFinite(tg_id)) return res.status(400).json({ error: "tg_id_required" });
 
-    await getOrCreateUser(tg_id);
+    await getOrCreateUserAndFreshen(tg_id);
 
     await upsertChats(tg_id, chats_upsert);
     await upsertMessages(tg_id, messages_upsert);
@@ -777,6 +932,56 @@ app.post("/api/sync/push", async (req, res) => {
     return res.status(500).json({ error: "server_error", details: String(e.message || e) });
   }
 });
+
+// -------------------------
+// OPTIONAL: Background worker (каждые 5 минут сброс всем просроченным)
+// Это НЕ обязательно, т.к. "ленивый сброс" уже есть.
+// -------------------------
+async function resetDueUsersBatch() {
+  const now = nowISO();
+  const nextReset = nextAlmatyMidnightISO(new Date());
+
+  // free
+  {
+    const { error } = await supabase
+      .from("lsd_users")
+      .update({
+        plans_left: DAILY_LIMITS.free.plans,
+        media_left: DAILY_LIMITS.free.media,
+        quota_next_reset_at: nextReset,
+        updated_at: now,
+      })
+      .eq("tier", "free")
+      .lte("quota_next_reset_at", now);
+
+    if (error) console.warn("reset batch free error:", error.message || error);
+  }
+
+  // premium
+  {
+    const { error } = await supabase
+      .from("lsd_users")
+      .update({
+        plans_left: DAILY_LIMITS.premium.plans,
+        media_left: DAILY_LIMITS.premium.media,
+        quota_next_reset_at: nextReset,
+        updated_at: now,
+      })
+      .eq("tier", "premium")
+      .lte("quota_next_reset_at", now);
+
+    if (error) console.warn("reset batch premium error:", error.message || error);
+  }
+}
+
+function startQuotaWorker() {
+  resetDueUsersBatch().catch(() => {});
+  setInterval(() => {
+    resetDueUsersBatch().catch((e) => console.warn("quota worker error:", e?.message || e));
+  }, 5 * 60 * 1000);
+}
+
+startQuotaWorker();
 
 // -------------------------
 app.listen(PORT, () => console.log(`✅ Server running on ${PORT}`));
