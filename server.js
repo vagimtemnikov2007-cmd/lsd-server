@@ -1,601 +1,771 @@
 import express from "express";
-import cors from "cors";
 import dotenv from "dotenv";
-import multer from "multer";
-import crypto from "crypto";
 import fetch from "node-fetch";
+import crypto from "crypto";
+import multer from "multer";
 import { createClient } from "@supabase/supabase-js";
 
 dotenv.config();
 
 const app = express();
+app.use(express.json({ limit: "8mb" }));
 
-// --------------------
-// CONFIG
-// --------------------
-const PORT = process.env.PORT || 3000;
-
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-
-// bucket name in Supabase Storage (optional)
-const STORAGE_BUCKET = process.env.SUPABASE_BUCKET || "lsd_uploads";
-
-// OpenAI model (Responses API)
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini"; // пример из docs-гайдов :contentReference[oaicite:1]{index=1}
-
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  console.warn("⚠️ SUPABASE env is missing (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY).");
-}
-if (!GEMINI_API_KEY) {
-  console.warn("⚠️ GEMINI_API_KEY is missing.");
-}
-
-const supabase =
-  SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
-    ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } })
-    : null;
-
-// --------------------
-// MIDDLEWARE
-// --------------------
-app.use(cors({ origin: "*", methods: ["GET", "POST", "OPTIONS"], allowedHeaders: ["Content-Type", "Authorization"] }));
-app.use(express.json({ limit: "12mb" }));
-
-// multer (memory)
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 25 * 1024 * 1024 }, // 25MB
+// -------------------------
+// CORS (simple)
+// -------------------------
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
 });
 
-// --------------------
-// HELPERS
-// --------------------
-function uid() {
-  return crypto.randomUUID?.() || crypto.randomBytes(16).toString("hex");
+// -------------------------
+// ENV
+// -------------------------
+const PORT = process.env.PORT || 3000;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+  console.error("❌ Missing ENV: SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY");
+  process.exit(1);
+}
+if (!GEMINI_API_KEY) {
+  console.warn("⚠️ GEMINI_API_KEY is missing — /api/chat/send and /api/plan/create will fail.");
 }
 
-function nowISO() {
-  return new Date().toISOString();
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+  auth: { persistSession: false },
+});
+
+// -------------------------
+// Utils
+// -------------------------
+const safeStr = (x) => (typeof x === "string" ? x : "");
+const nowISO = () => new Date().toISOString();
+const uuid = () => (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}_${Math.random()}`);
+
+async function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
-function safeParseJSON(str, fallback = null) {
-  try {
-    return JSON.parse(str);
-  } catch {
-    return fallback;
-  }
-}
+// -------------------------
+// Multer (multipart) — memory storage
+// -------------------------
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    // Telegram mini-app обычно нормально с этим живёт
+    fileSize: 8 * 1024 * 1024, // 8MB
+  },
+});
 
-function isImageMime(mime) {
-  return typeof mime === "string" && mime.startsWith("image/");
-}
+// -------------------------
+// Gemini (TEXT)
+// -------------------------
+async function callGeminiText(prompt) {
+  if (!GEMINI_API_KEY) throw new Error("missing_gemini_api_key");
 
-function toBase64(buffer) {
-  return buffer.toString("base64");
-}
+  const url =
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
 
-async function openaiResponses({ input }) {
-  const res = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${GEMINI_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: OPENAI_MODEL,
-      input,
-      // Можно добавить temperature при желании
-    }),
-  });
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        generationConfig: { temperature: 0.6 },
+      }),
+    });
 
-  const raw = await res.text();
-  const data = safeParseJSON(raw, { error: "bad_json_from_openai", raw });
+    const json = await r.json().catch(() => ({}));
 
-  return { ok: res.ok, status: res.status, data };
-}
-
-// вытаскиваем “чистый текст” из responses
-function extractResponseText(respJson) {
-  // Responses API может возвращать output массив, где есть content с type=output_text
-  const out = respJson?.output;
-  if (!Array.isArray(out)) return "";
-
-  let text = "";
-  for (const item of out) {
-    const content = item?.content;
-    if (!Array.isArray(content)) continue;
-    for (const c of content) {
-      if (c?.type === "output_text" && typeof c?.text === "string") text += c.text;
+    if (r.ok) {
+      return (
+        json?.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("").trim() || ""
+      );
     }
+
+    if (r.status === 429) {
+      await sleep(800 * attempt);
+      continue;
+    }
+
+    throw new Error(json?.error?.message || `gemini_error_${r.status}`);
   }
-  return text.trim();
+
+  return "Сейчас слишком много запросов (лимит API). Попробуй через минуту 🙂";
 }
 
-async function ensureUserRow(tg_id, profile = {}) {
-  if (!supabase) return { ok: true };
+// -------------------------
+// Gemini (PARTS) — text + inlineData (vision)
+// -------------------------
+async function callGeminiParts(parts, { temperature = 0.4 } = {}) {
+  if (!GEMINI_API_KEY) throw new Error("missing_gemini_api_key");
 
+  const url =
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts }],
+        generationConfig: { temperature },
+      }),
+    });
+
+    const json = await r.json().catch(() => ({}));
+
+    if (r.ok) {
+      return (
+        json?.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("").trim() || ""
+      );
+    }
+
+    if (r.status === 429) {
+      await sleep(800 * attempt);
+      continue;
+    }
+
+    throw new Error(json?.error?.message || `gemini_error_${r.status}`);
+  }
+
+  return "Сейчас слишком много запросов (лимит API). Попробуй через минуту 🙂";
+}
+
+// -------------------------
+// Plan JSON extraction
+// -------------------------
+function extractCards(text) {
+  const START = "@@LSD_JSON_START@@";
+  const END = "@@LSD_JSON_END@@";
+  const s = text.indexOf(START);
+  const e = text.indexOf(END);
+
+  if (s === -1 || e === -1 || e <= s) return { cleanText: text.trim(), cards: [], ok: false };
+
+  const jsonBlock = text.slice(s + START.length, e).trim();
+  const cleanText = (text.slice(0, s) + text.slice(e + END.length)).trim() || text.trim();
+
+  try {
+    const parsed = JSON.parse(jsonBlock);
+    const cards = Array.isArray(parsed?.cards) ? parsed.cards : [];
+    return { cleanText, cards, ok: cards.length > 0 };
+  } catch {
+    return { cleanText, cards: [], ok: false };
+  }
+}
+
+function buildTranscriptFromMessages(msgs) {
+  return (msgs || [])
+    .map((m) => `${m.role === "assistant" ? "AI" : "User"}: ${safeStr(m.content).trim()}`)
+    .filter(Boolean)
+    .join("\n");
+}
+
+// -------------------------
+// DB helpers
+// -------------------------
+async function getOrCreateUser(tg_id) {
   const { data, error } = await supabase
-    .from("users")
-    .upsert(
-      {
-        tg_id,
-        profile,
-        updated_at: nowISO(),
-        created_at: nowISO(),
-      },
-      { onConflict: "tg_id" }
-    )
-    .select()
+    .from("lsd_users")
+    .select("*")
+    .eq("tg_id", tg_id)
+    .maybeSingle();
+
+  if (error) throw error;
+  if (data) return data;
+
+  const { data: created, error: e2 } = await supabase
+    .from("lsd_users")
+    .insert({ tg_id, tier: "free", plans_left: 0, updated_at: nowISO() })
+    .select("*")
     .single();
 
-  if (error) return { ok: false, error };
-  return { ok: true, data };
+  if (e2) throw e2;
+  return created;
 }
 
-async function upsertChat(tg_id, chat_id, title = "Новый чат", emoji = "💬", updated_at = nowISO()) {
-  if (!supabase) return { ok: true };
-  const { error } = await supabase.from("chats").upsert(
-    {
-      tg_id,
-      chat_id,
-      title,
-      emoji,
-      updated_at,
-      created_at: nowISO(),
-    },
-    { onConflict: "chat_id" }
-  );
-  return error ? { ok: false, error } : { ok: true };
+async function getOrCreateChat(tg_id, chat_id, title = "Чат", emoji = "💬") {
+  const { data, error } = await supabase
+    .from("lsd_chats")
+    .select("*")
+    .eq("tg_id", tg_id)
+    .eq("chat_id", chat_id)
+    .maybeSingle();
+
+  if (error) throw error;
+  if (data) return data;
+
+  const { data: created, error: e2 } = await supabase
+    .from("lsd_chats")
+    .insert({ tg_id, chat_id, title, emoji, updated_at: nowISO() })
+    .select("*")
+    .single();
+
+  if (e2) throw e2;
+  return created;
+}
+
+async function touchChatUpdatedAt(tg_id, chat_id) {
+  const { error } = await supabase
+    .from("lsd_chats")
+    .update({ updated_at: nowISO() })
+    .eq("tg_id", tg_id)
+    .eq("chat_id", chat_id);
+
+  if (error) throw error;
 }
 
 async function insertMessage({ tg_id, chat_id, msg_id, role, content, created_at }) {
-  if (!supabase) return { ok: true };
-  const { error } = await supabase.from("messages").upsert(
-    {
-      tg_id,
-      chat_id,
-      msg_id,
-      role,
-      content,
-      created_at: created_at || nowISO(),
-    },
-    { onConflict: "msg_id" }
-  );
-  return error ? { ok: false, error } : { ok: true };
-}
-
-async function saveUserState({ tg_id, tasks_state, points }) {
-  if (!supabase) return { ok: true };
-  const { error } = await supabase.from("user_state").upsert(
-    {
-      tg_id,
-      tasks_state,
-      points,
-      updated_at: nowISO(),
-      created_at: nowISO(),
-    },
-    { onConflict: "tg_id" }
-  );
-  return error ? { ok: false, error } : { ok: true };
-}
-
-async function loadUserState(tg_id) {
-  if (!supabase) return { ok: true, data: { tasks_state: { groups: [] }, points: 0 } };
-
-  const { data, error } = await supabase.from("user_state").select("*").eq("tg_id", tg_id).maybeSingle();
-  if (error) return { ok: false, error };
-
-  return {
-    ok: true,
-    data: data || { tasks_state: { groups: [] }, points: 0 },
+  const row = {
+    tg_id,
+    chat_id,
+    role,
+    content,
+    created_at: created_at || nowISO(),
+    ...(msg_id ? { msg_id: safeStr(msg_id) } : {}),
   };
+
+  const { error } = await supabase.from("lsd_messages").insert(row);
+  if (error) throw error;
 }
 
-async function uploadToSupabaseStorage({ buffer, contentType, tg_id, chat_id, originalName }) {
-  if (!supabase) return { ok: false, error: "supabase_not_configured" };
+async function loadChatMessages({ tg_id, chat_id, limit = 120 }) {
+  const { data, error } = await supabase
+    .from("lsd_messages")
+    .select("role,content,created_at")
+    .eq("tg_id", tg_id)
+    .eq("chat_id", chat_id)
+    .order("created_at", { ascending: true })
+    .limit(limit);
 
-  const ext = (originalName || "file").split(".").pop();
-  const path = `${tg_id}/${chat_id}/${Date.now()}_${uid()}.${ext}`;
-
-  const { error } = await supabase.storage.from(STORAGE_BUCKET).upload(path, buffer, {
-    contentType: contentType || "application/octet-stream",
-    upsert: false,
-  });
-
-  if (error) return { ok: false, error };
-
-  // public URL (если bucket public). Если private — делай signed URL.
-  const { data } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(path);
-  return { ok: true, path, url: data?.publicUrl || null };
+  if (error) throw error;
+  return data || [];
 }
 
-function buildChatInputFromHistory(history, newUserItem) {
-  // history: [{role:"user"/"assistant", content:"..."}, ...]
-  // Responses API input: array of {role, content:[{type:"input_text", text:"..."}]}
-  const input = [];
+// ---- sync tables ----
+async function listChats(tg_id) {
+  const { data, error } = await supabase
+    .from("lsd_chats")
+    .select("chat_id,title,emoji,updated_at")
+    .eq("tg_id", tg_id)
+    .order("updated_at", { ascending: false })
+    .limit(200);
 
-  for (const m of history) {
-    if (!m?.content) continue;
-    input.push({
-      role: m.role,
-      content: [{ type: "input_text", text: String(m.content) }],
-    });
+  if (error) throw error;
+  return data || [];
+}
+
+async function listMessages(tg_id, sinceISO = null, limit = 4000) {
+  let q = supabase
+    .from("lsd_messages")
+    .select("chat_id,msg_id,role,content,created_at")
+    .eq("tg_id", tg_id)
+    .order("created_at", { ascending: true })
+    .limit(limit);
+
+  if (sinceISO) q = q.gte("created_at", sinceISO);
+
+  const { data, error } = await q;
+  if (error) throw error;
+
+  return (data || []).map((m) => ({
+    chat_id: m.chat_id,
+    msg_id: m.msg_id ?? null,
+    role: m.role,
+    content: m.content,
+    created_at: m.created_at,
+  }));
+}
+
+async function upsertChats(tg_id, chats) {
+  if (!Array.isArray(chats) || chats.length === 0) return;
+
+  const rows = chats
+    .map((c) => ({
+      tg_id,
+      chat_id: safeStr(c.chat_id),
+      title: safeStr(c.title) || "Чат",
+      emoji: safeStr(c.emoji) || "💬",
+      updated_at: safeStr(c.updated_at) || nowISO(),
+    }))
+    .filter((r) => r.chat_id);
+
+  if (!rows.length) return;
+
+  const { error } = await supabase
+    .from("lsd_chats")
+    .upsert(rows, { onConflict: "tg_id,chat_id" });
+
+  if (error) throw error;
+}
+
+async function upsertMessages(tg_id, messages) {
+  if (!Array.isArray(messages) || messages.length === 0) return;
+
+  const withId = [];
+  const withoutId = [];
+
+  for (const m of messages) {
+    const row = {
+      tg_id,
+      chat_id: safeStr(m.chat_id),
+      msg_id: safeStr(m.msg_id),
+      role: safeStr(m.role),
+      content: safeStr(m.content),
+      created_at: safeStr(m.created_at) || nowISO(),
+    };
+
+    const ok =
+      row.chat_id &&
+      row.role &&
+      (row.role === "user" || row.role === "assistant") &&
+      row.content;
+
+    if (!ok) continue;
+
+    if (row.msg_id) withId.push(row);
+    else
+      withoutId.push({
+        tg_id,
+        chat_id: row.chat_id,
+        role: row.role,
+        content: row.content,
+        created_at: row.created_at,
+      });
   }
 
-  // add new user item
-  input.push(newUserItem);
+  if (withId.length) {
+    const { error } = await supabase
+      .from("lsd_messages")
+      .upsert(withId, { onConflict: "tg_id,msg_id" });
+    if (error) throw error;
+  }
 
-  // system instruction
-  input.unshift({
-    role: "system",
-    content: [
-      {
-        type: "input_text",
-        text:
-          "Ты — ассистент LSD. Отвечай по-русски. Если пользователь прикрепил файл/фото — сначала коротко скажи что видишь/что это, потом помоги по задаче. Если данных мало — задай 1 уточняющий вопрос.",
-      },
-    ],
-  });
-
-  return input;
+  if (withoutId.length) {
+    const { error } = await supabase.from("lsd_messages").insert(withoutId);
+    if (error) throw error;
+  }
 }
 
-// --------------------
-// ROUTES
-// --------------------
-app.get("/", (_req, res) => res.send("LSD server OK"));
+// ---- tasks state (optional table) ----
+async function loadTasksState(tg_id) {
+  const { data, error } = await supabase
+    .from("lsd_tasks_state")
+    .select("state")
+    .eq("tg_id", tg_id)
+    .maybeSingle();
 
-// init user
+  if (error) throw error;
+  return data?.state || { groups: [] };
+}
+
+async function saveTasksState(tg_id, state) {
+  const payload = state && typeof state === "object" ? state : { groups: [] };
+
+  const { error } = await supabase
+    .from("lsd_tasks_state")
+    .upsert({ tg_id, state: payload, updated_at: nowISO() }, { onConflict: "tg_id" });
+
+  if (error) throw error;
+}
+
+// -------------------------
+// Health
+// -------------------------
+app.get("/health", (_, res) => res.json({ ok: true, time: nowISO() }));
+
+// -------------------------
+// API: USER INIT
+// -------------------------
 app.post("/api/user/init", async (req, res) => {
-  const tg_id = Number(req.body?.tg_id);
-  const profile = req.body?.profile || {};
+  try {
+    const tg_id = Number(req.body?.tg_id);
+    if (!Number.isFinite(tg_id)) return res.status(400).json({ error: "tg_id_required" });
 
-  if (!Number.isFinite(tg_id)) return res.status(400).json({ error: "bad_tg_id" });
-
-  const u = await ensureUserRow(tg_id, profile);
-  if (!u.ok) return res.status(500).json({ error: "supabase_user_upsert_failed", details: String(u.error?.message || u.error) });
-
-  const st = await loadUserState(tg_id);
-  if (!st.ok) return res.status(500).json({ error: "supabase_state_load_failed", details: String(st.error?.message || st.error) });
-
-  return res.json({
-    ok: true,
-    points: Number(st.data?.points || 0),
-    tasks_state: st.data?.tasks_state || { groups: [] },
-  });
+    const user = await getOrCreateUser(tg_id);
+    return res.json({
+      ok: true,
+      tg_id,
+      tier: user.tier,
+      plans_left: user.plans_left,
+      server_time: nowISO(),
+    });
+  } catch (e) {
+    console.error("USER INIT ERROR:", e);
+    return res.status(500).json({ error: "server_error", details: String(e.message || e) });
+  }
 });
 
-// send chat message (text)
+// -------------------------
+// API: CHAT SEND (text)
+// -------------------------
 app.post("/api/chat/send", async (req, res) => {
   try {
     const tg_id = Number(req.body?.tg_id);
-    const chat_id = String(req.body?.chat_id || "");
-    const text = String(req.body?.text || "").trim();
-    const msg_id = String(req.body?.msg_id || uid());
+    const chat_id = safeStr(req.body?.chat_id);
+    const text = safeStr(req.body?.text).trim();
     const profile = req.body?.profile || {};
+    const user_msg_id = safeStr(req.body?.msg_id) || uuid();
 
-    if (!Number.isFinite(tg_id)) return res.status(400).json({ error: "bad_tg_id" });
-    if (!chat_id) return res.status(400).json({ error: "bad_chat_id" });
-    if (!text) return res.status(400).json({ error: "empty_text" });
+    if (!Number.isFinite(tg_id)) return res.status(400).json({ error: "tg_id_required" });
+    if (!chat_id) return res.status(400).json({ error: "chat_id_required" });
+    if (!text) return res.status(400).json({ error: "text_required" });
 
-    await ensureUserRow(tg_id, profile);
-    await upsertChat(tg_id, chat_id, "Новый чат", "💬", nowISO());
+    const user = await getOrCreateUser(tg_id);
+    await getOrCreateChat(tg_id, chat_id, "Чат", "💬");
 
-    // store user message
-    await insertMessage({ tg_id, chat_id, msg_id, role: "user", content: text, created_at: nowISO() });
+    // save user message
+    await insertMessage({ tg_id, chat_id, msg_id: user_msg_id, role: "user", content: text });
+    await touchChatUpdatedAt(tg_id, chat_id);
 
-    // load last history for context
-    let history = [];
-    if (supabase) {
-      const { data: rows } = await supabase
-        .from("messages")
-        .select("role, content, created_at")
-        .eq("chat_id", chat_id)
-        .order("created_at", { ascending: true })
-        .limit(60);
+    const msgs = await loadChatMessages({ tg_id, chat_id, limit: 80 });
+    const transcript = buildTranscriptFromMessages(msgs);
 
-      history = (rows || []).map((r) => ({ role: r.role, content: r.content }));
-    }
+    const profileBlock = `
+Профиль пользователя:
+nick: ${profile?.nick || ""}
+age: ${profile?.age ?? ""}
+bio: ${profile?.bio || ""}
+`.trim();
 
-    if (GEMINI_API_KEY) {
-      const fallback = "GEMINI_API_KEY не задан. Я сохранил сообщение, но не могу спросить ИИ.";
-      await insertMessage({ tg_id, chat_id, msg_id: uid(), role: "assistant", content: fallback, created_at: nowISO() });
-      return res.json({ text: fallback });
-    }
+    const prompt = `
+Ты — LSD (AI Time Manager). Ты дружелюбный и умный собеседник.
+Отвечай на русском, кратко и по делу.
 
-    const input = buildChatInputFromHistory(history.slice(-40), {
-      role: "user",
-      content: [{ type: "input_text", text }],
+ВАЖНО:
+- НЕ создавай JSON и планы.
+- Учитывай историю ниже.
+
+${profileBlock}
+
+История:
+${transcript}
+
+Последнее сообщение:
+${text}
+`.trim();
+
+    const answer = await callGeminiText(prompt);
+
+    const ai_msg_id = uuid();
+    await insertMessage({ tg_id, chat_id, msg_id: ai_msg_id, role: "assistant", content: answer || "" });
+    await touchChatUpdatedAt(tg_id, chat_id);
+
+    return res.json({
+      ok: true,
+      text: answer || "",
+      user_msg_id,
+      ai_msg_id,
+      tier: user.tier,
+      plans_left: user.plans_left,
+      server_time: nowISO(),
     });
-
-    const ai = await openaiResponses({ input });
-    if (!ai.ok) return res.status(502).json({ error: "openai_failed", details: ai.data });
-
-    const answer = extractResponseText(ai.data) || "AI вернул пустой ответ 😶";
-
-    // store assistant message
-    await insertMessage({ tg_id, chat_id, msg_id: uid(), role: "assistant", content: answer, created_at: nowISO() });
-
-    // return (points may be updated by sync elsewhere; keep compatible with твоим фронтом)
-    return res.json({ text: answer });
   } catch (e) {
-    return res.status(500).json({ error: "server_exception", details: String(e?.message || e) });
+    console.error("CHAT ERROR:", e);
+    return res.status(500).json({ error: "server_error", details: String(e.message || e) });
   }
 });
 
-// attach file/photo
+// -------------------------
+// API: CHAT ATTACH (photo/file) ✅
+// ожидает multipart/form-data:
+// tg_id, chat_id, kind, profile (json string), file
+// -------------------------
 app.post("/api/chat/attach", upload.single("file"), async (req, res) => {
   try {
     const tg_id = Number(req.body?.tg_id);
-    const chat_id = String(req.body?.chat_id || "");
-    const kind = String(req.body?.kind || "file"); // "photo" | "file"
-    const profile = safeParseJSON(req.body?.profile || "{}", {}) || {};
-
-    if (!Number.isFinite(tg_id)) return res.status(400).json({ error: "bad_tg_id" });
-    if (!chat_id) return res.status(400).json({ error: "bad_chat_id" });
-    if (!req.file) return res.status(400).json({ error: "no_file" });
-
-    await ensureUserRow(tg_id, profile);
-    await upsertChat(tg_id, chat_id, "Новый чат", "💬", nowISO());
+    const chat_id = safeStr(req.body?.chat_id);
+    const kind = safeStr(req.body?.kind); // "photo" | "file"
+    const profileRaw = safeStr(req.body?.profile || "{}");
+    let profile = {};
+    try { profile = JSON.parse(profileRaw || "{}"); } catch { profile = {}; }
 
     const file = req.file;
-    const fileName = file.originalname || "upload";
-    const mime = file.mimetype || "application/octet-stream";
-    const size = Number(file.size || 0);
 
-    // 1) по желанию сохраняем в Supabase Storage и даём ссылку
-    let uploadedUrl = null;
-    if (supabase) {
-      const up = await uploadToSupabaseStorage({
-        buffer: file.buffer,
-        contentType: mime,
-        tg_id,
-        chat_id,
-        originalName: fileName,
-      });
-      if (up.ok) uploadedUrl = up.url;
-    }
+    if (!Number.isFinite(tg_id)) return res.status(400).json({ error: "tg_id_required" });
+    if (!chat_id) return res.status(400).json({ error: "chat_id_required" });
+    if (!file) return res.status(400).json({ error: "file_required" });
 
-    // 2) сохраняем “событие” как сообщение пользователя (чтобы история была целой)
-    const userLabel =
+    const user = await getOrCreateUser(tg_id);
+    await getOrCreateChat(tg_id, chat_id, "Чат", "💬");
+
+    // 1) сохраняем "сообщение пользователя" в БД (как в чате)
+    const label =
       kind === "photo"
-        ? `📷 Фото: ${fileName} (${Math.round(size / 1024)} KB)`
-        : `📎 Файл: ${fileName} (${Math.round(size / 1024)} KB)`;
+        ? `📷 Фото: ${file.originalname || "image"}`
+        : `📎 Файл: ${file.originalname || "file"}`;
 
-    await insertMessage({ tg_id, chat_id, msg_id: uid(), role: "user", content: userLabel, created_at: nowISO() });
+    const user_msg_id = uuid();
+    await insertMessage({ tg_id, chat_id, msg_id: user_msg_id, role: "user", content: label });
+    await touchChatUpdatedAt(tg_id, chat_id);
 
-    if (!GEMINI_API_KEY) {
-      const fallback = "OPENAI_API_KEY не задан. Файл/фото сохранил, но не могу отправить ИИ.";
-      await insertMessage({ tg_id, chat_id, msg_id: uid(), role: "assistant", content: fallback, created_at: nowISO() });
-      return res.json({ text: fallback });
-    }
+    // 2) строим контекст (история)
+    const msgs = await loadChatMessages({ tg_id, chat_id, limit: 60 });
+    const transcript = buildTranscriptFromMessages(msgs);
 
-    // load history
-    let history = [];
-    if (supabase) {
-      const { data: rows } = await supabase
-        .from("messages")
-        .select("role, content, created_at")
-        .eq("chat_id", chat_id)
-        .order("created_at", { ascending: true })
-        .limit(60);
-      history = (rows || []).map((r) => ({ role: r.role, content: r.content }));
-    }
+    const profileBlock = `
+Профиль пользователя:
+nick: ${profile?.nick || ""}
+age: ${profile?.age ?? ""}
+bio: ${profile?.bio || ""}
+`.trim();
 
-    // 3) строим input для OpenAI
-    let userItem;
+    // 3) если это картинка — отправляем vision в Gemini
+    const isImage = /^image\//i.test(file.mimetype || "");
+    let answer = "";
 
-    if (isImageMime(mime)) {
-      // Отправляем как input_image. :contentReference[oaicite:2]{index=2}
-      const b64 = toBase64(file.buffer);
-      const dataUrl = `data:${mime};base64,${b64}`;
+    if (isImage) {
+      const base64 = file.buffer.toString("base64");
 
-      userItem = {
-        role: "user",
-        content: [
-          { type: "input_text", text: "Проанализируй прикреплённое изображение и помоги по запросу пользователя." },
-          { type: "input_image", image_url: dataUrl, detail: "auto" },
-        ],
-      };
+      const parts = [
+        {
+          text: `
+Ты — LSD (AI Time Manager).
+Пользователь отправил изображение. Проанализируй его и помоги.
+
+Правила:
+- отвечай на русском
+- кратко и по делу
+- если на изображении текст/таблица — кратко перескажи и предложи следующий шаг
+- не создавай JSON-планы
+
+${profileBlock}
+
+История чата:
+${transcript}
+
+Задача: проанализируй изображение и ответь пользователю.
+`.trim(),
+        },
+        {
+          inlineData: {
+            mimeType: file.mimetype || "image/png",
+            data: base64,
+          },
+        },
+      ];
+
+      answer = await callGeminiParts(parts, { temperature: 0.2 });
     } else {
-      // Не изображение: даём ссылку (если есть) + мету
-      const metaText =
-        `Пользователь прикрепил файл.\n` +
-        `Имя: ${fileName}\nMIME: ${mime}\nРазмер: ${size} bytes\n` +
-        (uploadedUrl ? `Ссылка: ${uploadedUrl}\n` : "") +
-        `Если файл бинарный/не читается — попроси пользователя вставить текст/скрин/контент, который нужно обработать.`;
-
-      userItem = {
-        role: "user",
-        content: [{ type: "input_text", text: metaText }],
-      };
+      // НЕ-картинки: пока без парсинга pdf/doc — честно просим текст
+      answer =
+        `Я получил файл "${file.originalname}". ` +
+        `Пока я умею анализировать здесь только **фото/картинки**. ` +
+        `Если это документ — вставь сюда текст из файла, и я помогу.`;
     }
 
-    const input = buildChatInputFromHistory(history.slice(-35), userItem);
+    // 4) сохраняем ответ ассистента
+    const ai_msg_id = uuid();
+    await insertMessage({ tg_id, chat_id, msg_id: ai_msg_id, role: "assistant", content: answer || "" });
+    await touchChatUpdatedAt(tg_id, chat_id);
 
-    const ai = await openaiResponses({ input });
-    if (!ai.ok) return res.status(502).json({ error: "openai_failed", details: ai.data });
-
-    const answer = extractResponseText(ai.data) || "AI вернул пустой ответ 😶";
-
-    await insertMessage({ tg_id, chat_id, msg_id: uid(), role: "assistant", content: answer, created_at: nowISO() });
-
-    return res.json({ text: answer });
+    return res.json({
+      ok: true,
+      text: answer || "",
+      user_msg_id,
+      ai_msg_id,
+      tier: user.tier,
+      plans_left: user.plans_left,
+      server_time: nowISO(),
+    });
   } catch (e) {
-    return res.status(500).json({ error: "server_exception", details: String(e?.message || e) });
+    console.error("ATTACH ERROR:", e);
+    return res.status(500).json({ error: "server_error", details: String(e.message || e) });
   }
 });
 
-// plan create (возвращает cards как ожидает твой фронт)
+// -------------------------
+// API: PLAN CREATE
+// -------------------------
 app.post("/api/plan/create", async (req, res) => {
   try {
     const tg_id = Number(req.body?.tg_id);
-    const chat_id = String(req.body?.chat_id || "");
+    const chat_id = safeStr(req.body?.chat_id);
     const profile = req.body?.profile || {};
 
-    if (!Number.isFinite(tg_id)) return res.status(400).json({ error: "bad_tg_id" });
-    if (!chat_id) return res.status(400).json({ error: "bad_chat_id" });
+    if (!Number.isFinite(tg_id)) return res.status(400).json({ error: "tg_id_required" });
+    if (!chat_id) return res.status(400).json({ error: "chat_id_required" });
 
-    // соберём немного истории (последние ~25 сообщений)
-    let historyText = "";
-    if (supabase) {
-      const { data: rows } = await supabase
-        .from("messages")
-        .select("role, content")
-        .eq("chat_id", chat_id)
-        .order("created_at", { ascending: true })
-        .limit(50);
+    const user = await getOrCreateUser(tg_id);
+    const tier = safeStr(user?.tier) || "free";
+    const plansLeft = Number.isFinite(user?.plans_left) ? user.plans_left : 0;
 
-      historyText = (rows || [])
-        .map((r) => `${r.role === "assistant" ? "AI" : "USER"}: ${r.content}`)
-        .join("\n");
+    if (tier !== "developer" && plansLeft <= 0) {
+      return res.status(403).json({ error: "no_plans_left", tier, plans_left: plansLeft });
     }
 
-    if (!OPENAI_API_KEY) return res.json({ cards: [] });
+    const msgs = await loadChatMessages({ tg_id, chat_id, limit: 140 });
+    const transcript = buildTranscriptFromMessages(msgs);
+    if (!transcript.trim()) return res.json({ ok: true, cards: [], text: "", tier, plans_left: plansLeft });
 
-    const instruction =
-      `Сделай план задач в формате JSON.\n` +
-      `Верни строго JSON без лишнего текста.\n` +
-      `Схема:\n` +
-      `{"cards":[{"title":"строка","tasks":[{"t":"строка","min":number,"energy":"low|med|high"}]}]}\n` +
-      `Карточек 1-3, задач 3-8.\n` +
-      `Учитывай профиль: ${JSON.stringify(profile)}\n` +
-      `Контекст чата:\n${historyText}\n`;
+    const profileBlock = `
+Профиль пользователя:
+nick: ${profile?.nick || ""}
+age: ${profile?.age ?? ""}
+bio: ${profile?.bio || ""}
+`.trim();
 
-    const ai = await openaiResponses({
-      input: [
-        { role: "system", content: [{ type: "input_text", text: "Ты планировщик задач. Возвращай только JSON." }] },
-        { role: "user", content: [{ type: "input_text", text: instruction }] },
-      ],
-    });
+    const prompt = `
+Ты — LSD (AI Time Manager).
+Задача: сделать план в виде карточек на основе переписки.
 
-    if (!ai.ok) return res.status(502).json({ error: "openai_failed", details: ai.data });
+Требования:
+- 1–5 карточки
+- в каждой карточке 3 задачи
+- задачи конкретные
+- min: 10..180
+- energy: "focus" | "easy" | "hard"
 
-    const txt = extractResponseText(ai.data);
+Формат строго:
+@@LSD_JSON_START@@
+{ "cards": [ { "title": "...", "tasks": [ { "t": "...", "min": 30, "energy": "focus" } ] } ] }
+@@LSD_JSON_END@@
 
-    // пытаемся парсить
-    const obj = safeParseJSON(txt, null);
-    const cards = Array.isArray(obj?.cards) ? obj.cards : [];
+${profileBlock}
 
-    return res.json({ cards });
-  } catch (e) {
-    return res.status(500).json({ error: "server_exception", details: String(e?.message || e) });
-  }
-});
+Переписка:
+${transcript}
+`.trim();
 
-// sync push (то что твой фронт шлёт)
-app.post("/api/sync/push", async (req, res) => {
-  try {
-    const tg_id = Number(req.body?.tg_id);
-    if (!Number.isFinite(tg_id)) return res.status(400).json({ error: "bad_tg_id" });
+    const raw = await callGeminiText(prompt);
+    const parsed = extractCards(raw);
 
-    const chats_upsert = Array.isArray(req.body?.chats_upsert) ? req.body.chats_upsert : [];
-    const messages_upsert = Array.isArray(req.body?.messages_upsert) ? req.body.messages_upsert : [];
-    const tasks_state = req.body?.tasks_state || null;
-    const points = Number(req.body?.points);
-
-    await ensureUserRow(tg_id, req.body?.profile || {});
-
-    if (supabase) {
-      // chats
-      for (const c of chats_upsert) {
-        if (!c?.chat_id) continue;
-        await upsertChat(tg_id, String(c.chat_id), c.title || "Новый чат", c.emoji || "💬", c.updated_at || nowISO());
-      }
-
-      // messages
-      for (const m of messages_upsert) {
-        if (!m?.msg_id || !m?.chat_id) continue;
-        await insertMessage({
-          tg_id,
-          chat_id: String(m.chat_id),
-          msg_id: String(m.msg_id),
-          role: String(m.role || "user"),
-          content: String(m.content || ""),
-          created_at: m.created_at || nowISO(),
-        });
-      }
-
-      // state
-      if (tasks_state && typeof tasks_state === "object") {
-        await saveUserState({
-          tg_id,
-          tasks_state,
-          points: Number.isFinite(points) ? points : 0,
-        });
-      } else if (Number.isFinite(points)) {
-        // если tasks_state не пришёл, но очки пришли
-        const prev = await loadUserState(tg_id);
-        const prevTasks = prev.ok ? prev.data?.tasks_state : { groups: [] };
-        await saveUserState({ tg_id, tasks_state: prevTasks || { groups: [] }, points });
-      }
-    }
-
-    // возвращаем “истину” (points) чтобы фронт мог обновляться при желании
-    const st = await loadUserState(tg_id);
-    const outPoints = st.ok ? Number(st.data?.points || 0) : (Number.isFinite(points) ? points : 0);
-
-    return res.json({ ok: true, points: outPoints });
-  } catch (e) {
-    return res.status(500).json({ error: "server_exception", details: String(e?.message || e) });
-  }
-});
-
-// sync pull (то что твой фронт ждёт)
-app.post("/api/sync/pull", async (req, res) => {
-  try {
-    const tg_id = Number(req.body?.tg_id);
-    if (!Number.isFinite(tg_id)) return res.status(400).json({ error: "bad_tg_id" });
-
-    if (!supabase) {
+    if (!parsed.ok) {
       return res.json({
-        chats: [],
-        messages: [],
-        tasks_state: { groups: [] },
-        points: 0,
+        ok: true,
+        cards: [],
+        text: parsed.cleanText,
+        tier,
+        plans_left: plansLeft,
+        error: "plan_json_invalid",
       });
     }
 
-    const { data: chats, error: chatsErr } = await supabase
-      .from("chats")
-      .select("chat_id,title,emoji,updated_at")
-      .eq("tg_id", tg_id)
-      .order("updated_at", { ascending: false })
-      .limit(200);
+    const payload = { cards: parsed.cards, text: parsed.cleanText, created_at: nowISO(), chat_id };
 
-    if (chatsErr) return res.status(500).json({ error: "supabase_chats_failed", details: String(chatsErr.message) });
+    if (tier === "developer") {
+      await supabase.from("lsd_users").update({ current_plan: payload, updated_at: nowISO() }).eq("tg_id", tg_id);
+      return res.json({ ok: true, cards: parsed.cards, text: parsed.cleanText, tier, plans_left: plansLeft });
+    }
 
-    const chatIds = (chats || []).map((c) => c.chat_id);
+    let consumed = false;
+    try {
+      const { data, error } = await supabase.rpc("consume_plan_and_save", {
+        p_tg_id: tg_id,
+        p_plan: payload,
+      });
+      if (error) throw error;
 
-    const { data: messages, error: msgErr } = await supabase
-      .from("messages")
-      .select("chat_id,msg_id,role,content,created_at")
-      .eq("tg_id", tg_id)
-      .in("chat_id", chatIds.length ? chatIds : ["__none__"])
-      .order("created_at", { ascending: true })
-      .limit(2000);
+      const row = Array.isArray(data) ? data[0] : data;
+      consumed = true;
 
-    if (msgErr) return res.status(500).json({ error: "supabase_messages_failed", details: String(msgErr.message) });
+      return res.json({
+        ok: true,
+        cards: parsed.cards,
+        text: parsed.cleanText,
+        tier,
+        plans_left: row?.plans_left ?? Math.max(plansLeft - 1, 0),
+      });
+    } catch (e) {
+      console.warn("consume_plan_and_save skipped/fallback:", e?.message || e);
+    }
 
-    const st = await loadUserState(tg_id);
-    if (!st.ok) return res.status(500).json({ error: "supabase_state_failed", details: String(st.error?.message || st.error) });
+    if (!consumed) {
+      const newPlansLeft = Math.max(plansLeft - 1, 0);
+      await supabase
+        .from("lsd_users")
+        .update({ current_plan: payload, plans_left: newPlansLeft, updated_at: nowISO() })
+        .eq("tg_id", tg_id);
 
-    return res.json({
-      chats: chats || [],
-      messages: messages || [],
-      tasks_state: st.data?.tasks_state || { groups: [] },
-      points: Number(st.data?.points || 0),
-    });
+      return res.json({
+        ok: true,
+        cards: parsed.cards,
+        text: parsed.cleanText,
+        tier,
+        plans_left: newPlansLeft,
+        warning: "rpc_missing_fallback_used",
+      });
+    }
   } catch (e) {
-    return res.status(500).json({ error: "server_exception", details: String(e?.message || e) });
+    console.error("PLAN ERROR:", e);
+    return res.status(500).json({ error: "server_error", details: String(e.message || e) });
   }
 });
 
-// --------------------
-// START
-// --------------------
-app.listen(PORT, () => {
-  console.log(`✅ LSD server listening on :${PORT}`);
+// -------------------------
+// API: SYNC PULL
+// -------------------------
+app.post("/api/sync/pull", async (req, res) => {
+  try {
+    const tg_id = Number(req.body?.tg_id);
+    const since = safeStr(req.body?.since || "");
+
+    if (!Number.isFinite(tg_id)) return res.status(400).json({ error: "tg_id_required" });
+
+    await getOrCreateUser(tg_id);
+
+    const chats = await listChats(tg_id);
+    const messages = await listMessages(tg_id, since || null, 4000);
+
+    let tasks_state = { groups: [] };
+    try {
+      tasks_state = await loadTasksState(tg_id);
+    } catch (e) {
+      console.warn("loadTasksState skipped:", e?.message || e);
+    }
+
+    return res.json({
+      ok: true,
+      chats,
+      messages,
+      tasks_state,
+      server_time: nowISO(),
+    });
+  } catch (e) {
+    console.error("SYNC PULL ERROR:", e);
+    return res.status(500).json({ error: "server_error", details: String(e.message || e) });
+  }
 });
+
+// -------------------------
+// API: SYNC PUSH
+// -------------------------
+app.post("/api/sync/push", async (req, res) => {
+  try {
+    const tg_id = Number(req.body?.tg_id);
+    const chats_upsert = req.body?.chats_upsert;
+    const messages_upsert = req.body?.messages_upsert;
+    const tasks_state = req.body?.tasks_state;
+
+    if (!Number.isFinite(tg_id)) return res.status(400).json({ error: "tg_id_required" });
+
+    await getOrCreateUser(tg_id);
+
+    await upsertChats(tg_id, chats_upsert);
+    await upsertMessages(tg_id, messages_upsert);
+
+    if (tasks_state) {
+      try {
+        await saveTasksState(tg_id, tasks_state);
+      } catch (e) {
+        console.warn("saveTasksState skipped:", e?.message || e);
+      }
+    }
+
+    return res.json({ ok: true, server_time: nowISO() });
+  } catch (e) {
+    console.error("SYNC PUSH ERROR:", e);
+    return res.status(500).json({ error: "server_error", details: String(e.message || e) });
+  }
+});
+
+// -------------------------
+app.listen(PORT, () => console.log(`✅ Server running on ${PORT}`));
