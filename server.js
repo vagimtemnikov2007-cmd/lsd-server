@@ -614,73 +614,80 @@ app.post("/telegram/webhook", async (req, res) => {
 
     // 2) successful_payment — здесь АКТИВИРУЕМ PREMIUM
     // прилетает в message.successful_payment
-    const msg = update.message;
-    const sp = msg?.successful_payment;
+// 2) successful_payment — здесь АКТИВИРУЕМ PREMIUM
+const msg = update.message;
+const sp = msg?.successful_payment;
 
-    if (sp) {
-      // payload из invoice
-      let payload = {};
-      try {
-        payload = JSON.parse(sp.invoice_payload || "{}");
-      } catch {
-        payload = {};
-      }
+if (sp) {
+  // payload из invoice
+  let payload = {};
+  try {
+    payload = JSON.parse(sp.invoice_payload || "{}");
+  } catch {
+    payload = {};
+  }
 
-      const tg_id = Number(payload?.tg_id);
-      const plan = payload?.plan;
+  const tg_id = Number(payload?.tg_id);
+  const plan = payload?.plan;
+  const type = payload?.type;
 
-      // provider_charge_id бывает у обычных платежей; у Stars может быть другое поле.
-      // мы сохраним что найдём, а если пусто — сделаем свой id по hash.
-      const provider_charge_id =
-        sp.provider_payment_charge_id ||
-        sp.telegram_payment_charge_id ||
-        crypto.createHash("sha256").update(JSON.stringify(sp)).digest("hex");
+  // Важно: проверяем, что это наша покупка
+  if (!Number.isFinite(tg_id) || (plan !== "month" && plan !== "year") || type !== "lsd_premium") {
+    return res.json({ ok: true });
+  }
 
-      const currency = sp.currency || "XTR";
-      const total_amount = Number.isFinite(Number(sp.total_amount)) ? Number(sp.total_amount) : null;
+  // idempotency key (у Stars обычно есть telegram_payment_charge_id)
+  const provider_charge_id =
+    sp.telegram_payment_charge_id ||
+    sp.provider_payment_charge_id ||
+    crypto.createHash("sha256").update(JSON.stringify(sp)).digest("hex");
 
-      if (Number.isFinite(tg_id) && (plan === "month" || plan === "year")) {
-        // 2.1) пишем оплату в БД (защита от дубля)
-        // если дубль — просто пропустим
-        try {
-          const { error: payErr } = await supabase.from("lsd_payments").insert({
-            tg_id,
-            provider_charge_id,
-            currency,
-            total_amount,
-            plan,
-          });
-          if (payErr) {
-            // если уникальный конфликт — норм, значит мы уже активировали
-            const msgE = String(payErr?.message || payErr);
-            if (!msgE.toLowerCase().includes("duplicate") && !msgE.toLowerCase().includes("unique")) {
-              console.warn("lsd_payments insert error:", msgE);
-            }
-          }
-        } catch (e) {
-          console.warn("lsd_payments insert throw:", e?.message || e);
-        }
+  const currency = sp.currency || "XTR";
+  const total_amount = Number.isFinite(Number(sp.total_amount)) ? Number(sp.total_amount) : null;
 
-        // 2.2) активируем premium
-        const updatedUser = await activatePremiumForUser(tg_id, plan);
+  // 2.1) Пишем оплату в БД — если дубль, значит уже обработали → просто выходим
+  const { error: payErr } = await supabase.from("lsd_payments").insert({
+    tg_id,
+    provider_charge_id,
+    currency,
+    total_amount,
+    plan,
+    payload, // храним исходный payload тоже
+  });
 
-        // 2.3) опционально: отправим сообщение в чат (если хочешь)
-        // chat_id = msg.chat.id
-        try {
-          await tgApi("sendMessage", {
-            chat_id: msg.chat.id,
-            text:
-              `✅ LSD Premium активирован!\n` +
-              `План: ${plan === "year" ? "год" : "месяц"}\n` +
-              `Действует до: ${new Date(updatedUser.premium_until).toLocaleString("ru-RU")}`,
-          });
-        } catch (e) {
-          console.warn("sendMessage failed:", e?.message || e);
-        }
-      }
+  if (payErr) {
+    const msgE = String(payErr?.message || payErr);
+    const lower = msgE.toLowerCase();
 
+    // Если уникальный конфликт — это повторный webhook, ничего не делаем
+    if (lower.includes("duplicate") || lower.includes("unique")) {
       return res.json({ ok: true });
     }
+
+    console.warn("lsd_payments insert error:", msgE);
+    // даже если таблица упала — лучше не активировать премиум, чтобы не было читов
+    return res.json({ ok: true });
+  }
+
+  // 2.2) Активируем premium
+  const updatedUser = await activatePremiumForUser(tg_id, plan);
+
+  // 2.3) Отправим подтверждение
+  try {
+    await tgApi("sendMessage", {
+      chat_id: msg.chat.id,
+      text:
+        `✅ LSD Premium активирован!\n` +
+        `План: ${plan === "year" ? "год" : "месяц"}\n` +
+        `Действует до: ${new Date(updatedUser.premium_until).toLocaleString("ru-RU")}`,
+    });
+  } catch (e) {
+    console.warn("sendMessage failed:", e?.message || e);
+  }
+
+  return res.json({ ok: true });
+}
+
 
     return res.json({ ok: true });
   } catch (e) {
